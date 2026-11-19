@@ -19,7 +19,9 @@ they are skipped otherwise.
 
 1. **Tests first-class.** Every behaviour change comes with a test in the matching suite:
    `test_database_and_ast.py`, `test_security_firewall.py`, `test_mcp_tools.py`,
-   `test_swarm_and_timetravel.py`, `test_web_and_plugins.py`.
+   `test_swarm_and_timetravel.py`, `test_web_and_plugins.py`, and the v0.2 suites
+   `test_v02_heal_and_rules.py`, `test_v02_plugins.py`, `test_v02_analysis.py`,
+   `test_v02_sessions_policy_budget.py`, `test_v02_tooling.py`.
 2. **No credential-shaped literals** anywhere in the repo, including tests. Generate them with
    `tests.conftest.fake_secret()`. GitHub push protection will block you otherwise, and rightly so.
 3. **Cross-platform.** `pathlib`, `encoding="utf-8"`, argument-list subprocesses, no shell scripts.
