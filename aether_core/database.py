@@ -19,7 +19,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+# ``schema_version`` is the on-disk format contract (bumped only for breaking changes). ``schema_revision``
+# counts additive changes (new tables/indexes) that older readers can safely ignore.
 SCHEMA_VERSION = 1
+SCHEMA_REVISION = 2  # v0.2: session_checkpoints, budget_usage
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -155,6 +158,30 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
     updated_at REAL NOT NULL,
     data TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    session TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL,
+    files TEXT NOT NULL DEFAULT '[]',
+    pending TEXT NOT NULL DEFAULT '[]',
+    decisions TEXT NOT NULL DEFAULT '[]',
+    notes TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL,
+    tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_created ON session_checkpoints(created_at);
+
+CREATE TABLE IF NOT EXISTS budget_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    session TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_budget_session ON budget_usage(session);
 """
 
 FTS_SCHEMA = """
@@ -318,10 +345,12 @@ class AetherDB:
                 self.fts_enabled = True
             except sqlite3.OperationalError:
                 self.fts_enabled = False
-            self._conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
+            # Every schema change is additive (CREATE ... IF NOT EXISTS), so older brains upgrade in place.
+            for key, value in (("schema_version", SCHEMA_VERSION), ("schema_revision", SCHEMA_REVISION)):
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, str(value)),
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -690,7 +719,8 @@ class AetherDB:
         files = self.query(
             "SELECT f.id, f.path, f.language, f.line_count, f.token_estimate, r.name AS repo_name, "
             "(SELECT COUNT(*) FROM nodes n WHERE n.file_id = f.id) AS node_count, "
-            "(SELECT COUNT(*) FROM scars s WHERE s.file_path = f.path) AS scar_count "
+            "(SELECT COUNT(*) FROM scars s WHERE s.file_path = f.path) AS scar_count, "
+            "(SELECT COUNT(*) FROM nodes n WHERE n.file_id = f.id AND n.kind = 'route') AS route_count "
             "FROM files f JOIN repos r ON r.id = f.repo_id ORDER BY node_count DESC LIMIT ?",
             (limit_files,),
         )
@@ -853,6 +883,105 @@ class AetherDB:
         )
         return [dict(r) for r in reversed(rows)]
 
+    def telemetry_latency_percentiles(self) -> dict[str, float]:
+        """p50/p95 latency of context queries (exact, computed over every recorded query)."""
+        rows = self.query("SELECT latency_ms FROM telemetry WHERE kind = 'context_query' ORDER BY latency_ms")
+        values = [float(r["latency_ms"]) for r in rows]
+        if not values:
+            return {"p50": 0.0, "p95": 0.0}
+
+        def pct(q: float) -> float:
+            idx = min(len(values) - 1, max(0, int(round(q * (len(values) - 1)))))
+            return round(values[idx], 2)
+
+        return {"p50": pct(0.5), "p95": pct(0.95)}
+
+    def telemetry_top_queries(self, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT ts, compressed_tokens, raw_tokens, saved_tokens, latency_ms, payload FROM telemetry "
+            "WHERE kind = 'context_query' ORDER BY compressed_tokens DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        out = []
+        for r in rows:
+            payload = json.loads(r["payload"] or "{}")
+            out.append({"query": str(payload.get("query", "")), "compressed_tokens": int(r["compressed_tokens"]),
+                        "raw_tokens": int(r["raw_tokens"]), "saved_tokens": int(r["saved_tokens"]),
+                        "latency_ms": round(float(r["latency_ms"]), 2), "ts": float(r["ts"])})
+        return out
+
+    # ------------------------------------------------------------------ session checkpoints
+    def add_checkpoint(self, session: str, goal: str, files: Sequence[str], pending: Sequence[str],
+                       decisions: Sequence[str], notes: str, summary: str, tokens: int) -> int:
+        cur = self.execute(
+            "INSERT INTO session_checkpoints(created_at, session, goal, files, pending, decisions, notes, summary, tokens) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), session, goal, json.dumps(list(files), ensure_ascii=False),
+             json.dumps(list(pending), ensure_ascii=False), json.dumps(list(decisions), ensure_ascii=False),
+             notes, summary, int(tokens)),
+        )
+        return int(cur.lastrowid or 0)
+
+    @staticmethod
+    def _checkpoint_row(r: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(r["id"]), "created_at": float(r["created_at"]), "session": r["session"], "goal": r["goal"],
+            "files": json.loads(r["files"] or "[]"), "pending": json.loads(r["pending"] or "[]"),
+            "decisions": json.loads(r["decisions"] or "[]"), "notes": r["notes"], "summary": r["summary"],
+            "tokens": int(r["tokens"]),
+        }
+
+    def get_checkpoint(self, checkpoint_id: int | None = None) -> dict[str, Any] | None:
+        if checkpoint_id is None:
+            rows = self.query("SELECT * FROM session_checkpoints ORDER BY created_at DESC, id DESC LIMIT 1")
+        else:
+            rows = self.query("SELECT * FROM session_checkpoints WHERE id = ?", (int(checkpoint_id),))
+        return self._checkpoint_row(rows[0]) if rows else None
+
+    def list_checkpoints(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query("SELECT * FROM session_checkpoints ORDER BY created_at DESC, id DESC LIMIT ?", (limit,))
+        return [self._checkpoint_row(r) for r in rows]
+
+    # ------------------------------------------------------------------ context budget
+    def record_budget(self, session: str, tool: str, tokens: int, detail: dict[str, Any] | None = None) -> None:
+        self.execute(
+            "INSERT INTO budget_usage(ts, session, tool, tokens, detail) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), session, tool, int(tokens), json.dumps(detail or {}, ensure_ascii=False, default=str)),
+        )
+
+    def budget_session_total(self, session: str) -> int:
+        return int(self.scalar("SELECT COALESCE(SUM(tokens), 0) FROM budget_usage WHERE session = ?", (session,)) or 0)
+
+    def budget_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT session, COUNT(*) AS calls, SUM(tokens) AS tokens, MIN(ts) AS started, MAX(ts) AS last "
+            "FROM budget_usage GROUP BY session ORDER BY last DESC LIMIT ?",
+            (limit,),
+        )
+        return [{"session": r["session"], "calls": int(r["calls"]), "tokens": int(r["tokens"] or 0),
+                 "started": float(r["started"]), "last": float(r["last"])} for r in rows]
+
+    def budget_by_tool(self, session: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT tool, COUNT(*) AS calls, SUM(tokens) AS tokens, MAX(tokens) AS peak FROM budget_usage"
+        params: tuple[Any, ...] = ()
+        if session:
+            sql += " WHERE session = ?"
+            params = (session,)
+        sql += " GROUP BY tool ORDER BY tokens DESC"
+        return [{"tool": r["tool"], "calls": int(r["calls"]), "tokens": int(r["tokens"] or 0), "peak": int(r["peak"] or 0)}
+                for r in self.query(sql, params)]
+
+    def budget_details(self, session: str | None = None, limit: int = 2000) -> list[dict[str, Any]]:
+        sql = "SELECT ts, session, tool, tokens, detail FROM budget_usage"
+        params: list[Any] = []
+        if session:
+            sql += " WHERE session = ?"
+            params.append(session)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return [{"ts": float(r["ts"]), "session": r["session"], "tool": r["tool"], "tokens": int(r["tokens"]),
+                 "detail": json.loads(r["detail"] or "{}")} for r in self.query(sql, params)]
+
     # ------------------------------------------------------------------ events
     def insert_event(self, type_: str, origin: str, nodes: Sequence[str], payload: dict[str, Any], ts: float) -> int:
         cur = self.execute(
@@ -943,4 +1072,5 @@ class AetherDB:
             "decisions": int(self.scalar("SELECT COUNT(*) FROM decisions") or 0),
             "snapshots": int(self.scalar("SELECT COUNT(*) FROM snapshots") or 0),
             "routes": int(self.scalar("SELECT COUNT(*) FROM nodes WHERE kind = 'route'") or 0),
+            "checkpoints": int(self.scalar("SELECT COUNT(*) FROM session_checkpoints") or 0),
         }

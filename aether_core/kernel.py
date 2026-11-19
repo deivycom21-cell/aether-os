@@ -12,10 +12,12 @@ from typing import Any
 
 from aether_core import AETHER_DIRNAME, __version__
 from aether_core.ast_indexer import GraphResolver, IndexStats, Indexer
+from aether_core.budget import DEFAULT_BUDGET_TOKENS, BudgetTracker
 from aether_core.context_engine import ContextEngine
-from aether_core.database import AetherDB, normalize_severity
+from aether_core.database import AetherDB, normalize_rel_path, normalize_severity
 from aether_core.event_bus import EventBus
 from aether_core.git_sync import TEAM_BRAIN_FILENAME, SnapshotManager, export_team_brain, import_team_brain
+from aether_core.policy import POLICY_FILENAME, Policy
 from aether_core.security import PromptInjectionDetector, SecretVault, SecurityScanner
 
 CONFIG_FILENAME = "config.json"
@@ -29,6 +31,7 @@ class AetherConfig:
     trusted_plugins: list[str] = field(default_factory=list)
     disabled_plugins: list[str] = field(default_factory=list)
     web_port: int = 7777
+    budget_tokens: int = DEFAULT_BUDGET_TOKENS
 
     @classmethod
     def load(cls, path: Path) -> AetherConfig:
@@ -43,6 +46,7 @@ class AetherConfig:
             trusted_plugins=list(data.get("trusted_plugins", [])),
             disabled_plugins=list(data.get("disabled_plugins", [])),
             web_port=int(data.get("web_port", 7777)),
+            budget_tokens=max(1000, int(data.get("budget_tokens", DEFAULT_BUDGET_TOKENS))),
         )
 
     def save(self, path: Path) -> None:
@@ -54,6 +58,7 @@ class AetherConfig:
                     "trusted_plugins": self.trusted_plugins,
                     "disabled_plugins": self.disabled_plugins,
                     "web_port": self.web_port,
+                    "budget_tokens": self.budget_tokens,
                 },
                 indent=2,
             ),
@@ -90,8 +95,46 @@ class AetherKernel:
         self.resolver = GraphResolver(self.db)
         self.context = ContextEngine(self.db, self.bus, self.vault, self.injection)
         self.snapshots = SnapshotManager(self.root, self.aether_dir, self.db, self.bus)
+        self.budget = BudgetTracker(self.db, self.bus, self.config.budget_tokens)
+        self._policy = Policy.load(self.aether_dir)
+        self._policy_mtime = self._policy_file_mtime()
+        self.context.read_policy = lambda: self.policy.can_read
         self._index_lock = threading.Lock()
+        self._hotspot_cache: tuple[tuple[Any, ...], list[Any]] | None = None
         self.started_at = time.time()
+
+    # ------------------------------------------------------------------ policy
+    def _policy_file_mtime(self) -> float:
+        try:
+            return (self.aether_dir / POLICY_FILENAME).stat().st_mtime
+        except OSError:
+            return 0.0
+
+    @property
+    def policy(self) -> Policy:
+        """Current ``.aether/policy.json`` (re-read whenever the file changes on disk)."""
+        mtime = self._policy_file_mtime()
+        if mtime != self._policy_mtime:
+            self._policy = Policy.load(self.aether_dir)
+            self._policy_mtime = mtime
+        return self._policy
+
+    def save_policy(self, policy: Policy) -> Path:
+        path = policy.save(self.aether_dir)
+        self._policy = policy
+        self._policy_mtime = self._policy_file_mtime()
+        return path
+
+    def check_path_policy(self, path: str) -> dict[str, Any]:
+        return self.policy.explain(path)
+
+    def repo_roots(self) -> dict[str, Path]:
+        roots = {self.repo_name: self.root}
+        for link in self.config.linked_repos:
+            lp = Path(link["path"])
+            if lp.is_dir():
+                roots[link["name"]] = lp.resolve()
+        return roots
 
     # ------------------------------------------------------------------ repos
     @property
@@ -183,6 +226,9 @@ class AetherKernel:
         return self.context.query(query, max_tokens=max_tokens)
 
     def impact_analysis(self, file_path: str) -> dict[str, Any]:
+        if not self.policy.can_read(file_path):
+            self.bus.publish("POLICY_BLOCKED", {"action": "impact_analysis", "file": normalize_rel_path(file_path)})
+            return {"file": file_path, "found": False, "error": "denied by .aether/policy.json"}
         return self.context.impact_analysis(file_path)
 
     def record_scar(self, file_path: str, error_summary: str, fix_applied: str, severity: str = "high",
@@ -213,8 +259,15 @@ class AetherKernel:
     def create_snapshot(self, label: str = "manual") -> dict[str, Any]:
         return self.snapshots.create(label or "manual").to_dict()
 
-    def rollback_snapshot(self, snapshot_id: str) -> dict[str, Any]:
-        result = self.snapshots.rollback(snapshot_id)
+    def rollback_snapshot(self, snapshot_id: str, prune_new: bool = True) -> dict[str, Any]:
+        diff = self.snapshots.diff(snapshot_id)
+        touched = [*diff["modified"], *diff["removed"], *(diff["added"] if prune_new else [])]
+        blocked = [p for p in touched if not self.policy.can_write(p)]
+        if blocked:
+            self.bus.publish("POLICY_BLOCKED", {"action": "rollback", "snapshot_id": snapshot_id, "files": blocked[:20]})
+            return {"ok": False, "error": "rollback would modify read-only/denied paths (.aether/policy.json)",
+                    "blocked": blocked[:50], "restored": 0, "deleted_new_files": 0, "safety_snapshot": None}
+        result = self.snapshots.rollback(snapshot_id, prune_new=prune_new)
         if result["restored"] or result["deleted_new_files"]:
             self.index(run_plugins=False)
         return result
@@ -278,8 +331,270 @@ class AetherKernel:
                 "recent": swarm,
             },
             "series": self.db.telemetry_series(40),
+            "latency": self.db.telemetry_latency_percentiles(),
+            "budget": self.budget.status(),
+            "dependency_findings": sec.get("dependency", 0),
             "uptime_s": round(time.time() - self.started_at, 1),
         }
+
+    # ------------------------------------------------------------------ v0.2 · auto-fix loop
+    def prepare_heal_context(self, command: str = "", output: str | None = None, max_tokens: int = 1500) -> dict[str, Any]:
+        """Run ``command`` (policy-checked) or analyse ``output``; write ``.aether/last_heal_context.json``."""
+        from aether_core.healer import Healer, HealError
+
+        if not command.strip() and output is None:
+            return {"ok": False, "error": "pass a command to run or the failing output to analyse"}
+        try:
+            return Healer(self).prepare(command, output=output, max_tokens=max_tokens)
+        except HealError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def heal(self, command: str, execute: bool = False, max_attempts: int = 3, llm: Any = None,
+             keep_failed: bool = False) -> dict[str, Any]:
+        from aether_core.healer import Healer, HealError
+
+        healer = Healer(self)
+        try:
+            if not execute:
+                return healer.prepare(command)
+            return healer.execute(command, max_attempts=max_attempts, llm=llm, keep_failed=keep_failed)
+        except HealError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------ v0.2 · living rules & docs
+    def rules_facts(self) -> dict[str, Any]:
+        from aether_core.docs_gen import endpoints, module_graph
+
+        pol = self.policy
+        graph = module_graph(self.db)
+        scars = [s.to_dict() for s in self.db.list_scars(500) if s.severity in {"critical", "high"}]
+        return {
+            "project": self.repo_name,
+            "linked_repos": [r["name"] for r in self.config.linked_repos],
+            "index_version": self.db.index_version(),
+            "counts": {
+                **self.db.counts(),
+                "code_files": sum(m["files"] for m in graph["modules"]),
+                "code_symbols": sum(m["symbols"] for m in graph["modules"]),
+                "code_edges": int(self.db.scalar(
+                    "SELECT COUNT(*) FROM edges e JOIN files a ON a.id = e.src_file_id JOIN files b ON b.id = e.dst_file_id "
+                    "WHERE a.language NOT IN ('markdown', 'text') AND b.language NOT IN ('markdown', 'text')") or 0),
+            },
+            "modules": graph["modules"],
+            "module_edges": graph["edges"],
+            "routes": [e for e in endpoints(self.db) if pol.can_read(e["file"])],
+            "decisions": self.db.list_decisions(),
+            "scars": [s for s in scars if pol.can_read(s["file_path"])],
+            "hotspots": [h.to_dict() for h in self.hotspot_map()[:5]],
+        }
+
+    def sync_rules(self, targets: list[str] | None = None, dry_run: bool = False) -> dict[str, Any]:
+        from aether_core.context_engine import estimate_tokens
+        from aether_core.rules_sync import DEFAULT_TARGETS, render_rules, upsert_block, write_rules
+
+        body = self.vault.mask(render_rules(self.rules_facts())).text
+        names = list(targets or DEFAULT_TARGETS)
+        if dry_run:
+            files = [{"path": t, "action": "dry-run"} for t in names]
+        else:
+            files = write_rules(self.root, body, names, self.policy.can_write)
+            self.bus.publish("RULES_SYNCED", {"files": [f["path"] for f in files if f["action"] in {"created", "updated"}],
+                                              "tokens": estimate_tokens(body)})
+        return {"ok": True, "files": files, "tokens": estimate_tokens(body), "block": upsert_block("", body)}
+
+    def generate_docs(self, out: str | None = "docs/AETHER_DOCS.md", write: bool = True) -> dict[str, Any]:
+        from aether_core.docs_gen import render_docs
+
+        result = render_docs(self.db, self.repo_name, self.db.index_version())
+        result["markdown"] = self.vault.mask(result["markdown"]).text
+        result["path"] = None
+        if write and out:
+            rel = normalize_rel_path(out)
+            target = (self.root / rel).resolve()
+            if self.root not in target.parents:
+                return {"ok": False, "error": "output must be inside the project"}
+            if not self.policy.can_write(rel):
+                self.bus.publish("POLICY_BLOCKED", {"action": "docs", "file": rel})
+                return {"ok": False, "error": f"{rel} is read-only or denied by .aether/policy.json"}
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(result["markdown"], encoding="utf-8")
+            result["path"] = rel
+            self.bus.publish("DOCS_GENERATED", {"file": rel, "modules": result["modules"], "endpoints": result["endpoints"]},
+                             [f"{self.repo_name}:{rel}"])
+        result["ok"] = True
+        return result
+
+    # ------------------------------------------------------------------ v0.2 · share card
+    def share_metrics(self) -> dict[str, Any]:
+        totals = self.db.telemetry_totals()
+        pct = (totals["saved_tokens"] / totals["raw_tokens"] * 100.0) if totals["raw_tokens"] else 0.0
+        return {
+            "project": self.repo_name, "version": __version__, "files_indexed": self.db.counts()["files"],
+            "tokens_saved": totals["saved_tokens"], "savings_pct": round(pct, 2), "usd_saved": totals["saved_usd"],
+            "p50_ms": self.db.telemetry_latency_percentiles()["p50"], "queries": totals["queries"],
+            "series": [r["saved_tokens"] for r in self.db.telemetry_series(40)],
+        }
+
+    def share_card(self, out: Path | str | None = None) -> dict[str, Any]:
+        from aether_core.share_card import render_share_card
+
+        metrics = self.share_metrics()
+        svg = render_share_card(metrics)
+        target = Path(out) if out else self.aether_dir / "share" / "aether-card.svg"
+        target = (Path.cwd() / target).resolve() if not target.is_absolute() else target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(svg, encoding="utf-8")
+        return {"ok": True, "path": str(target), "bytes": len(svg.encode("utf-8")), "metrics": metrics}
+
+    # ------------------------------------------------------------------ v0.2 · hotspots
+    def hotspot_map(self, commits: int = 500) -> list[Any]:
+        from aether_core.hotspots import compute_hotspots, git_head
+
+        roots = self.repo_roots()
+        key = (self.db.index_version(), self.db.counts()["scars"], commits, tuple(git_head(r) for r in roots.values()))
+        if self._hotspot_cache is not None and self._hotspot_cache[0] == key:
+            return self._hotspot_cache[1]
+        pol = self.policy
+        spots = [h for h in compute_hotspots(self.db, roots, commits) if pol.can_read(h.file)]
+        self._hotspot_cache = (key, spots)
+        return spots
+
+    def get_code_hotspots(self, limit: int = 15, commits: int = 500) -> dict[str, Any]:
+        spots = self.hotspot_map(commits)
+        top = [h.to_dict() for h in spots[: max(1, int(limit))]]
+        levels: dict[str, int] = {}
+        for h in spots:
+            levels[h.level] = levels.get(h.level, 0) + 1
+        self.bus.publish("ANALYSIS", {"kind": "hotspots", "files": len(spots), "top": top[0]["file"] if top else ""},
+                         [f"{h['repo']}:{h['file']}" for h in top[:12]])
+        return {"hotspots": top, "files_analyzed": len(spots), "by_level": levels,
+                "weights": {"complexity": 0.30, "fan_in": 0.25, "churn": 0.25, "scars": 0.20}, "commits_considered": commits}
+
+    # ------------------------------------------------------------------ v0.2 · episodic memory
+    def save_session_checkpoint(self, goal: str, files_touched: list[str] | None = None, pending: list[str] | None = None,
+                                decisions: list[str] | None = None, notes: str = "", auto_files: bool = True) -> dict[str, Any]:
+        from aether_core.sessions import MAX_CHECKPOINT_TOKENS, build_checkpoint, git_touched_files
+
+        if not goal.strip():
+            return {"ok": False, "error": "goal is required"}
+        files = [normalize_rel_path(f) for f in (files_touched or [])]
+        if not files and auto_files:
+            files = git_touched_files(self.root)
+        pol = self.policy
+        files = [f for f in files if pol.can_read(f)]
+        summary, tokens, kept = build_checkpoint(
+            self.vault.mask(goal).text, files, [self.vault.mask(p).text for p in pending or []],
+            [self.vault.mask(d).text for d in decisions or []], self.vault.mask(notes).text, MAX_CHECKPOINT_TOKENS)
+        cid = self.db.add_checkpoint(self.budget.session, str(kept["goal"]), list(kept["files"]), list(kept["pending"]),
+                                     list(kept["decisions"]), str(kept["notes"]), summary, tokens)
+        self.bus.publish("CHECKPOINT_SAVED", {"id": cid, "goal": str(kept["goal"])[:120], "tokens": tokens,
+                                              "files": len(kept["files"])}, [f"{self.repo_name}:{f}" for f in kept["files"]][:30])
+        return {"ok": True, "id": cid, "tokens": tokens, "summary": summary, "files": kept["files"]}
+
+    def resume_session(self, checkpoint_id: int | None = None) -> dict[str, Any]:
+        cp = self.db.get_checkpoint(checkpoint_id if checkpoint_id else None)
+        if cp is None:
+            return {"ok": False, "error": "no checkpoint found" if not checkpoint_id else f"checkpoint {checkpoint_id} not found"}
+        scars = []
+        for f in cp["files"][:10]:
+            scars += [{"file": s.file_path, "severity": s.severity, "error": s.error_summary}
+                      for s in self.db.scars_for_path(f, record_hit=False) if s.severity in {"critical", "high"}]
+        masked, _ = self.vault.mask_obj({**cp, "ok": True, "age_s": round(time.time() - cp["created_at"], 1),
+                                         "scars_on_files": scars[:8]})
+        return masked
+
+    # ------------------------------------------------------------------ v0.2 · code intelligence
+    def semantic_diff(self, ref: str = "HEAD", paths: list[str] | None = None, compact: bool = False,
+                      max_files: int | None = None) -> dict[str, Any]:
+        """Symbol-level diff. ``compact`` (used for agents) truncates signatures and turns body-only
+        changes into counts; ``max_files`` caps the per-file section (the summary always covers everything)."""
+        from aether_core.semantic_diff import SemanticDiffError, semantic_diff
+
+        try:
+            result = semantic_diff(self.root, ref, paths)
+        except SemanticDiffError as exc:
+            return {"ok": False, "error": str(exc)}
+        pol = self.policy
+        result["files"] = [f for f in result["files"] if pol.can_read(f["path"])]
+        result["breaking"] = [b for b in result["breaking"] if pol.can_read(b["file"])]
+        if compact:
+            def clip(text: str) -> str:
+                return text if len(text) <= 160 else text[:159] + "…"
+
+            for f in result["files"]:
+                f["modified"] = len(f["modified"])
+                if len(f["added"]) > 20:
+                    f["added_not_listed"] = len(f["added"]) - 20
+                f["added"] = [{"kind": x["kind"], "symbol": x["symbol"]} for x in f["added"][:20]]
+                for item in f["removed"]:
+                    item["signature"] = clip(item.get("signature", ""))
+                for item in f["signature_changed"]:
+                    item["before"], item["after"] = clip(item["before"]), clip(item["after"])
+            for b in result["breaking"]:
+                for key in ("before", "after"):
+                    if key in b:
+                        b[key] = clip(b[key])
+        if max_files is not None and len(result["files"]) > max_files:
+            result["files_truncated"] = len(result["files"]) - max_files
+            result["files"] = result["files"][:max_files]
+        masked, _ = self.vault.mask_obj(result)
+        masked["ok"] = True
+        self.bus.publish("ANALYSIS", {"kind": "semantic_diff", "ref": ref, **result["summary"],
+                                      "breaking": len(result["breaking"])},
+                         [f"{self.repo_name}:{f['path']}" for f in result["files"][:30]])
+        return masked
+
+    def find_dead_code(self, min_confidence: str = "medium", limit: int = 200) -> dict[str, Any]:
+        from aether_core.dead_code import find_dead_code
+
+        result = find_dead_code(self.db, self.repo_roots(), min_confidence, limit)
+        pol = self.policy
+        result["dead_symbols"] = [d for d in result["dead_symbols"] if pol.can_read(d["file"])]
+        masked, _ = self.vault.mask_obj(result)
+        self.bus.publish("ANALYSIS", {"kind": "dead_code", "symbols": result["total"],
+                                      "lines": result["dead_lines_estimate"]},
+                         sorted({f"{d['repo']}:{d['file']}" for d in result["dead_symbols"][:30]}))
+        return masked
+
+    def generate_tests(self, file_path: str, out: str | None = None, write: bool = True, force: bool = False) -> dict[str, Any]:
+        from aether_core.test_gen import TestGenError, generate
+
+        rel = normalize_rel_path(file_path)
+        if not self.policy.can_read(rel):
+            return {"ok": False, "error": f"{rel} is denied by .aether/policy.json"}
+        try:
+            result = generate(self.root, rel, out)
+        except TestGenError as exc:
+            return {"ok": False, "error": str(exc)}
+        result["ok"] = True
+        result["written"] = False
+        if write:
+            target = (self.root / result["output"]).resolve()
+            if self.root not in target.parents:
+                return {"ok": False, "error": "output must be inside the project"}
+            if not self.policy.can_write(result["output"]):
+                return {"ok": False, "error": f"{result['output']} is read-only or denied by .aether/policy.json"}
+            if target.exists() and not force:
+                return {**result, "ok": False, "error": f"{result['output']} exists (use --force to overwrite)"}
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(result["content"], encoding="utf-8")
+            result["written"] = True
+        return result
+
+    # ------------------------------------------------------------------ v0.2 · context budget
+    def record_budget(self, tool: str, response: Any, query: str = "", files: list[str] | None = None) -> dict[str, Any]:
+        return self.budget.record(tool, response, query=query, files=files)
+
+    def budget_report(self, session: str | None = None, all_sessions: bool = False) -> dict[str, Any]:
+        report = self.budget.report(session, all_sessions)
+        masked, _ = self.vault.mask_obj(report)
+        return masked
+
+    def set_budget_threshold(self, tokens: int) -> int:
+        self.config.budget_tokens = max(1000, int(tokens))
+        self.config.save(self.config_path)
+        self.budget.threshold = self.config.budget_tokens
+        return self.config.budget_tokens
 
     # ------------------------------------------------------------------ team brain
     @property

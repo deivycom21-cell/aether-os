@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-os"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first multi-repo graph memory kernel, secret shield, swarm orchestrator and 3D telemetry for AI coding agents (Claude Code, Cursor, Windsurf, Aider)."
 readme = "README.md"
 license = { text = "MIT" }

@@ -17,6 +17,7 @@ import re
 import threading
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -296,6 +297,23 @@ class ContextEngine:
         self.vault = vault
         self.injection = injection_detector
         self.searcher = HybridSearcher(db)
+        # ``read_policy() -> (rel_path -> bool)``: the kernel installs the .aether/policy.json read check here.
+        # It is resolved once per query and memoised per path (hits repeat the same files many times).
+        self.read_policy: Callable[[], Callable[[str], bool]] | None = None
+
+    def _path_filter(self) -> Callable[[str], bool] | None:
+        if self.read_policy is None:
+            return None
+        check = self.read_policy()
+        cache: dict[str, bool] = {}
+
+        def allowed(path: str) -> bool:
+            hit = cache.get(path)
+            if hit is None:
+                hit = cache[path] = check(path)
+            return hit
+
+        return allowed
 
     # ------------------------------------------------------------------ query
     def query(self, query: str, max_tokens: int = 1500, limit: int = 12) -> dict[str, Any]:
@@ -315,6 +333,16 @@ class ContextEngine:
         used = 0
         seen_quals: set[str] = set()
         covered: dict[int, list[tuple[int, int]]] = defaultdict(list)  # file_id -> line ranges already sent
+        hidden_by_policy: set[str] = set()
+        path_ok = self._path_filter()
+        if path_ok is not None:
+            hidden_by_policy = {n.path for n, _ in hits if not path_ok(n.path)}
+            if hidden_by_policy:
+                hits = [(n, sc) for n, sc in hits if n.path not in hidden_by_policy]
+
+        def allowed(path: str) -> bool:
+            return path_ok is None or path_ok(path)
+
         top_score = hits[0][1] if hits else 0.0
         for node, score in hits:
             if node.qualname in seen_quals:
@@ -369,10 +397,11 @@ class ContextEngine:
                 {
                     "file": path,
                     "repo": repo,
-                    "depends_on": sorted({d["dst_path"] for d in deps if d["dst_path"]})[:8],
-                    "used_by": sorted({d["path"] for d in dependents})[:8],
+                    "depends_on": sorted({d["dst_path"] for d in deps if d["dst_path"] and allowed(d["dst_path"])})[:8],
+                    "used_by": sorted({d["path"] for d in dependents if allowed(d["path"])})[:8],
                     "used_by_count": len({d["file_id"] for d in dependents}),
-                    "cross_repo_consumers": sorted({f"{d['repo_name']}:{d['path']}" for d in dependents if d["repo_name"] != repo})[:6],
+                    "cross_repo_consumers": sorted({f"{d['repo_name']}:{d['path']}" for d in dependents
+                                                    if d["repo_name"] != repo and allowed(d["path"])})[:6],
                 }
             )
 
@@ -399,6 +428,9 @@ class ContextEngine:
             warnings.append(f"Prompt-injection patterns found in: {', '.join(sorted(set(injected_files)))}")
         if scars:
             warnings.insert(0, f"⚠ {len(scars)} scar(s) recorded on these files — read them before editing.")
+        if hidden_by_policy:
+            warnings.append(f"{len(hidden_by_policy)} file(s) hidden by .aether/policy.json")
+            self.bus.publish("POLICY_BLOCKED", {"action": "query_smart_context", "files": len(hidden_by_policy)})
 
         package: dict[str, Any] = {
             "query": query,

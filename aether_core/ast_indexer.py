@@ -61,6 +61,14 @@ SKIP_FILE_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.l
 
 HTTP_METHODS = ("get", "post", "put", "delete", "patch", "head", "options")
 
+# Plugin-owned synthetic file records (e.g. ``@aether/db_schema/schema.prisma``) never exist on disk;
+# the indexer leaves them alone and the owning plugin prunes its own stale records.
+VIRTUAL_PREFIX = "@aether/"
+
+
+def is_virtual_path(rel: str) -> bool:
+    return rel.startswith(VIRTUAL_PREFIX)
+
 
 def detect_language(path: Path) -> str | None:
     name = path.name.lower()
@@ -889,7 +897,7 @@ class Indexer:
             stats.nodes += len(parsed.nodes)
             stats.edges += len(parsed.edges)
         for rel, (fid, _) in known.items():
-            if rel in seen:
+            if rel in seen or is_virtual_path(rel):
                 continue
             on_disk = root / rel
             # Plugin-managed records (e.g. .env.example names) stay while their file exists.
