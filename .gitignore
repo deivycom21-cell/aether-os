@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local, machine-specific outputs
+benchmarks/results.json
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Editor
+.idea/
+.vscode/
+
+.aether_build_state.json
+.aether/
+.venv/
+__pycache__/
