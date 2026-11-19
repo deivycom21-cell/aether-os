@@ -12,6 +12,7 @@ from typing import Annotated, Any, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -36,6 +37,13 @@ def _kernel(root: Path | None) -> Any:
     from aether_core.kernel import AetherKernel
 
     return AetherKernel(root)
+
+
+def _fresh_kernel(root: Path | None) -> Any:
+    """Kernel with an incrementally refreshed graph (unchanged files are skipped by sha1)."""
+    k = _kernel(root)
+    k.index(run_plugins=False)
+    return k
 
 
 def _print_json(data: Any) -> None:
@@ -167,7 +175,7 @@ def query(
         console.print(f"[violet]{rel['file']}[/] depends on {len(rel['depends_on'])}, used by {rel['used_by_count']}"
                       + (f", cross-repo: {', '.join(rel['cross_repo_consumers'])}" if rel["cross_repo_consumers"] else ""))
     for s in pkg["scars"]:
-        console.print(f"[{SEV_STYLE.get(s['severity'], '')}]scar[{s['severity']}][/] {s['file']}: {s['error']} -> {s['fix']}")
+        console.print(f"[{SEV_STYLE.get(s['severity'], '')}]scar\\[{s['severity']}][/] {escape(s['file'])}: {escape(s['error'])} -> {escape(s['fix'])}")
     console.print(
         f"\n[green]{m['raw_tokens']:,} -> {m['compressed_tokens']:,} tokens (-{m['savings_pct']}%)[/] · saved "
         f"${m['saved_usd']['sonnet']:.4f} (Sonnet) / ${m['saved_usd']['opus']:.4f} (Opus) · {m['latency_ms']} ms"
@@ -303,8 +311,29 @@ def rollback(
 
 
 @app.command()
-def scan(target: Annotated[str, typer.Argument()] = ".", root: RootOpt = None, as_json: JsonOpt = False) -> None:
+def scan(
+    target: Annotated[str, typer.Argument()] = ".",
+    staged: Annotated[bool, typer.Option("--staged", help="Scan only lines added in the staged git diff (pre-commit mode).")] = False,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
     """Scan for leaked secrets and prompt-injection payloads."""
+    if staged:
+        from aether_core.kernel import find_project_root
+        from aether_core.precommit import format_report, scan_staged
+
+        try:
+            report = scan_staged((root or find_project_root()).resolve())
+        except (OSError, RuntimeError) as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(2) from exc
+        if as_json:
+            _print_json(report)
+        else:
+            typer.echo(format_report(report))
+        if not report["ok"]:
+            raise typer.Exit(1)
+        return
     r = _kernel(root).scan_security(target)
     if as_json or "error" in r:
         _print_json(r)
@@ -366,41 +395,39 @@ def mcp(root: RootOpt = None, no_auto_index: Annotated[bool, typer.Option("--no-
 
 @app.command("install-mcp")
 def install_mcp(
-    client: Annotated[str, typer.Option("--client", "-c", help="claude | cursor | windsurf | all")] = "all",
-    print_only: Annotated[bool, typer.Option("--print", help="Only print the configuration.")] = False,
+    client: Annotated[Optional[list[str]], typer.Option("--client", "-c", "--target", "-t",
+                      help="claude | cursor | windsurf | vscode (cline/roo) | zed | opencode | all (repeatable).")] = None,
+    install_all: Annotated[bool, typer.Option("--all", help="Install for every supported IDE.")] = False,
+    print_only: Annotated[bool, typer.Option("--print", help="Only print the server entry; write nothing.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show which files would change.")] = False,
     root: RootOpt = None,
 ) -> None:
-    """Register the Aether MCP server for Claude Code (.mcp.json) and Cursor (.cursor/mcp.json)."""
+    """Register the Aether MCP server in Claude Code, Cursor, Windsurf, Cline/Roo Code, Zed and OpenCode."""
     from aether_core.kernel import find_project_root
+    from aether_core.mcp_install import install, resolve_targets
 
     project = (root or find_project_root()).resolve()
-    server = {"command": sys.executable, "args": ["-m", "aether_core.cli", "mcp", "--root", str(project)]}
-    targets: list[tuple[str, Path]] = []
-    if client in {"claude", "all"}:
-        targets.append(("Claude Code", project / ".mcp.json"))
-    if client in {"cursor", "all"}:
-        targets.append(("Cursor", project / ".cursor" / "mcp.json"))
-    snippet = json.dumps({"mcpServers": {"aether": server}}, indent=2)
-    if print_only or client == "windsurf":
-        typer.echo(snippet)  # plain output: Rich would wrap long paths and break copy-paste
-        if client in {"windsurf", "all"}:
-            console.print("[dim]Windsurf: add the block above to ~/.codeium/windsurf/mcp_config.json[/]")
+    command, args = sys.executable, ["-m", "aether_core.cli", "mcp", "--root", str(project)]
+    if print_only:
+        typer.echo(json.dumps({"mcpServers": {"aether": {"command": command, "args": args}}}, indent=2))
         return
-    for name, path in targets:
-        data: dict[str, Any] = {}
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                console.print(f"[red]{path} is not valid JSON; not modified[/]")
-                continue
-        data.setdefault("mcpServers", {})["aether"] = server
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        console.print(f"[green]{name}[/] -> {path}")
-    if client == "all":
-        console.print("[dim]Windsurf: run `aether install-mcp --client windsurf` to print its snippet. "
+    try:
+        targets = resolve_targets(client, install_all)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    failed = False
+    for r in install(project, targets, command, args, dry_run=dry_run):
+        if r["ok"]:
+            console.print(f"[green]{r['label']}[/] {r['action']} -> {r['path']}")
+        else:
+            failed = True
+            console.print(f"[red]{r['label']}[/] {r['path']}: {r['error']}")
+    if not install_all and not client:
+        console.print("[dim]More IDEs: aether install-mcp --all (Windsurf, Cline/Roo Code, Zed, OpenCode). "
                       "Aider: use `aether query \"...\" --json` via /run.[/]")
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -589,6 +616,376 @@ def route(prompt: str, as_json: JsonOpt = False) -> None:
         f"est. ${d['est_cost_usd']:.5f} vs ${d['baseline_cost_usd']:.5f} on {d['baseline_model']} "
         f"([green]-{d['savings_pct']}%[/])\n" + "\n".join(f"- {r}" for r in d["reasons"]),
         border_style="violet"))
+
+
+# ---------------------------------------------------------------------------- v0.2: heal, rules, share
+
+
+@app.command()
+def heal(
+    command: Annotated[str, typer.Argument(help='Test/build command, e.g. "pytest -x" or "npm test".')],
+    execute: Annotated[bool, typer.Option("--execute", help="Let your LLM (BYOK) repair it: snapshot + up to 3 attempts.")] = False,
+    attempts: Annotated[int, typer.Option("--attempts", min=1, max=3)] = 3,
+    keep_failed: Annotated[bool, typer.Option("--keep-failed", help="Keep edits of a failed --execute run (default: roll back).")] = False,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Run COMMAND; on failure build .aether/last_heal_context.json (frames, scars, smart context)."""
+    k = _kernel(root)
+    r = k.heal(command, execute=execute, max_attempts=attempts, keep_failed=keep_failed)
+    if as_json or "error" in r:
+        _print_json(r)
+        if "error" in r or not r.get("ok", True):
+            raise typer.Exit(1)
+        return
+    if execute:
+        style = "green" if r["ok"] else "red"
+        console.print(Panel.fit(f"[{style}]{r['status'].upper()}[/] · {len(r['attempts'])} attempt(s) · "
+                                f"snapshot {r.get('snapshot') or '-'}" + (" · rolled back" if r.get("rolled_back") else ""),
+                                title="aether heal --execute", border_style=style))
+        for a in r["attempts"]:
+            console.print(f"  attempt {a['attempt']}: {'[green]passed[/]' if a.get('ok') else '[red]failed[/]'} "
+                          + escape(f"{a.get('model', '')} {', '.join(a.get('files', []))} {a.get('error', '')}"))
+        if not r["ok"]:
+            raise typer.Exit(1)
+        return
+    if r["status"] == "passing":
+        console.print(f"[green]PASSING[/] {escape(r['command'])} ({r['duration_ms']} ms) · nothing to heal")
+        return
+    console.print(Panel.fit(f"[red]FAILING[/] {escape(r['command'])} (exit {r['returncode']}, {r['duration_ms']} ms)\n"
+                            f"context -> [bold]{r['context_file']}[/]", title="aether heal", border_style="red"))
+    for e in r["errors"][:5]:
+        console.print(f"[red]error[/] {escape(e)}")
+    for fr in r["frames"][:5]:
+        console.print(Panel(Text(fr["snippet"]), title=escape(f"{fr['file']}:{fr['line']} {fr['symbol']}"), title_align="left",
+                            border_style="grey30"))
+    for sc in r["scars"]:
+        console.print(f"[{SEV_STYLE.get(sc['severity'], '')}]scar\\[{sc['severity']}][/] {escape(sc['file'])}: {escape(sc['error'])} -> {escape(sc['fix'])}")
+    console.print("[dim]Feed the context file to your agent, or re-run with --execute (BYOK) to auto-repair.[/]")
+    raise typer.Exit(1)
+
+
+@app.command("sync-rules")
+def sync_rules(
+    target: Annotated[Optional[list[str]], typer.Option("--target", "-t", help="Rules file(s) to update (default: CLAUDE.md, .cursorrules).")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", "--print", help="Print the generated block; write nothing.")] = False,
+    root: RootOpt = None,
+) -> None:
+    """Refresh the <!-- AETHER:START/END --> block in CLAUDE.md and .cursorrules with live architecture facts."""
+    r = _fresh_kernel(root).sync_rules(target, dry_run=dry_run)
+    if dry_run:
+        typer.echo(r["block"])
+        return
+    for f in r["files"]:
+        style = {"created": "green", "updated": "cyan", "unchanged": "grey50"}.get(f["action"], "red")
+        console.print(f"[{style}]{f['action']}[/] {escape(f['path'])}" + (f" ({escape(f['reason'])})" if f.get("reason") else ""))
+    console.print(f"[dim]managed block: ~{r['tokens']} tokens; content outside the markers is untouched[/]")
+
+
+@app.command()
+def share(
+    out: Annotated[Optional[Path], typer.Option("--out", "-o", help="SVG path (default .aether/share/aether-card.svg).")] = None,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Render a self-contained SVG card with your real token/USD savings, ready for X / Reddit."""
+    r = _kernel(root).share_card(out)
+    if as_json:
+        _print_json(r)
+        return
+    m = r["metrics"]
+    console.print(f"[green]share card[/] -> [bold]{r['path']}[/] ({r['bytes'] / 1024:.1f} KB)")
+    console.print(f"  {m['project']} · {m['files_indexed']} files · {m['tokens_saved']:,} tokens saved "
+                  f"({m['savings_pct']}%) · ${m['usd_saved']:.4f} · p50 {m['p50_ms']} ms · {m['queries']} queries")
+
+
+# ---------------------------------------------------------------------------- v0.2: code intelligence
+
+
+@app.command()
+def hotspots(
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 15,
+    commits: Annotated[int, typer.Option("--commits", help="Git history depth for churn.")] = 500,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Technical-debt hotspots: 0-100 risk from complexity, fan-in, git churn and scars."""
+    r = _fresh_kernel(root).get_code_hotspots(limit, commits)
+    if as_json:
+        _print_json(r)
+        return
+    t = Table(title=f"hotspots · {r['files_analyzed']} code files", title_style="bold cyan", border_style="cyan")
+    for col in ("risk", "file", "cx", "worst fn", "fan-in", "churn", "scars", "why"):
+        t.add_column(col, justify="right" if col in {"risk", "cx", "fan-in", "churn", "scars"} else "left",
+                     no_wrap=col != "why", overflow="ellipsis", min_width=24 if col == "file" else None)
+    style = {"critical": "bold red", "high": "dark_orange", "medium": "yellow", "low": "green"}
+    for h in r["hotspots"]:
+        t.add_row(Text(f"{h['risk_score']:.0f}", style=style[h["level"]]), Text(h["file"]), str(h["complexity"]),
+                  f"{h['worst_function'].rsplit('.', 1)[-1]} ({h['max_function_complexity']})" if h["worst_function"] else "-",
+                  str(h["fan_in"]), str(h["churn"]), str(h["scars"]), Text("; ".join(h["reasons"])))
+    console.print(t)
+
+
+@app.command("semantic-diff")
+def semantic_diff_cmd(
+    ref: Annotated[str, typer.Argument(help="Git ref to compare the working tree against.")] = "HEAD",
+    path: Annotated[Optional[list[str]], typer.Option("--path", "-p", help="Limit to these files (repeatable).")] = None,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Symbol-level diff (functions, classes, routes) of the working tree vs REF."""
+    r = _kernel(root).semantic_diff(ref, path)
+    if as_json or not r.get("ok"):
+        _print_json(r)
+        if not r.get("ok"):
+            raise typer.Exit(1)
+        return
+    s = r["summary"]
+    console.print(Panel.fit(f"vs [bold]{ref}[/] · {s['files']} files · [green]+{s['added']}[/] [red]-{s['removed']}[/] "
+                            f"[yellow]~{s['signature_changed']} signatures[/] · {s['modified']} bodies · {s['renamed']} renamed"
+                            + (f" · [bold red]{len(r['breaking'])} potentially breaking[/]" if r["breaking"] else ""),
+                            border_style="violet", title="semantic diff"))
+    for f in r["files"]:
+        console.print(f"[bold]{escape(f['path'])}[/] [dim]({f['status']})[/]")
+        for x in f["added"]:
+            console.print(f"  [green]+ {x['kind']}[/] {escape(x['symbol'])}  [dim]{escape(x['signature'][:90])}[/]")
+        for x in f["removed"]:
+            console.print(f"  [red]- {x['kind']}[/] {escape(x['symbol'])}")
+        for x in f["renamed"]:
+            console.print(f"  [cyan]» {x['kind']}[/] {escape(x['from'])} -> {escape(x['to'])}")
+        for x in f["signature_changed"]:
+            console.print(f"  [yellow]~ {x['kind']}[/] {escape(x['symbol'])}\n      [dim]{escape(x['before'][:100])}[/]\n      {escape(x['after'][:100])}")
+        for x in f["modified"]:
+            console.print(f"  [grey62]* {x['kind']}[/] {escape(x['symbol'])} [dim](body)[/]")
+
+
+@app.command("dead-code")
+def dead_code(
+    min_confidence: Annotated[str, typer.Option("--min-confidence", "-c", help="high | medium | low")] = "medium",
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 100,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Symbols and endpoints with zero incoming references (excludes routes, tests, entrypoints)."""
+    if min_confidence not in {"high", "medium", "low"}:
+        console.print("[red]--min-confidence must be high, medium or low[/]")
+        raise typer.Exit(2)
+    r = _fresh_kernel(root).find_dead_code(min_confidence, limit)
+    if as_json:
+        _print_json(r)
+        return
+    t = Table(title=f"dead code · {r['total']} symbols · ~{r['dead_lines_estimate']} lines", title_style="bold violet",
+              border_style="violet")
+    for col in ("conf", "kind", "symbol", "location", "lines"):
+        t.add_column(col, justify="right" if col == "lines" else "left")
+    for d in r["dead_symbols"]:
+        t.add_row(d["confidence"], d["kind"], Text(d["symbol"]), Text(f"{d['file']}:{d['line']}"), str(d["lines"]))
+    console.print(t)
+    for u in r["unconsumed_routes"][:30]:
+        console.print(f"[yellow]unconsumed route[/] " + escape(f"{u['method']} {u['path']} -> {u['handler']} ({u['file']}:{u['line']})"))
+    console.print(f"[dim]{escape(r['unconsumed_routes_note'])} Excluded: {escape(str(r['excluded']))}[/]")
+
+
+@app.command("gen-tests")
+def gen_tests(
+    file_path: Annotated[str, typer.Argument(help="Source file (Python -> pytest, JS/TS -> vitest).")],
+    out: Annotated[Optional[str], typer.Option("--out", "-o", help="Output path relative to the project.")] = None,
+    print_only: Annotated[bool, typer.Option("--print", help="Print instead of writing.")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+    root: RootOpt = None,
+) -> None:
+    """Generate a runnable test skeleton (signature locks, smoke calls, route probes) for FILE_PATH."""
+    r = _kernel(root).generate_tests(file_path, out, write=not print_only, force=force)
+    if not r.get("ok"):
+        console.print(f"[red]{escape(r['error'])}[/]")
+        raise typer.Exit(1)
+    if print_only:
+        typer.echo(r["content"])
+        return
+    c = r["counts"]
+    console.print(f"[green]{r['framework']}[/] skeleton -> [bold]{r['output']}[/] · {c['signature']} signature locks · "
+                  f"{c['smoke']} smoke calls · {c['routes']} route probes")
+
+
+@app.command()
+def docs(
+    out: Annotated[str, typer.Option("--out", "-o", help="Markdown output (relative to the project).")] = "docs/AETHER_DOCS.md",
+    print_only: Annotated[bool, typer.Option("--print", help="Print instead of writing.")] = False,
+    root: RootOpt = None,
+) -> None:
+    """Generate living docs: Mermaid module-dependency diagram + API endpoint table."""
+    r = _fresh_kernel(root).generate_docs(out, write=not print_only)
+    if not r.get("ok"):
+        console.print(f"[red]{escape(r['error'])}[/]")
+        raise typer.Exit(1)
+    if print_only:
+        typer.echo(r["markdown"])
+        return
+    console.print(f"[green]docs[/] -> [bold]{r['path']}[/] · {r['modules']} modules · {r['module_edges']} module edges · "
+                  f"{r['endpoints']} endpoints")
+
+
+# ---------------------------------------------------------------------------- v0.2: sessions, budget, policy, hooks
+
+
+@app.command()
+def checkpoint(
+    goal: Annotated[str, typer.Argument(help="What you are trying to achieve.")],
+    file: Annotated[Optional[list[str]], typer.Option("--file", "-f", help="Touched file (repeatable; default: git status).")] = None,
+    pending: Annotated[Optional[list[str]], typer.Option("--pending", "-p", help="Pending step (repeatable).")] = None,
+    decision_: Annotated[Optional[list[str]], typer.Option("--decision", "-d", help="Decision taken (repeatable).")] = None,
+    notes: Annotated[str, typer.Option("--notes", "-n")] = "",
+    root: RootOpt = None,
+) -> None:
+    """Save an episodic checkpoint (< 400 tokens) to resume this task in a fresh session."""
+    r = _kernel(root).save_session_checkpoint(goal, file, pending, decision_, notes)
+    if not r.get("ok"):
+        console.print(f"[red]{escape(r['error'])}[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]checkpoint #{r['id']}[/] saved · {r['tokens']} tokens · {len(r['files'])} files")
+
+
+@app.command()
+def resume(
+    checkpoint_id: Annotated[Optional[int], typer.Argument(help="Checkpoint id (default: latest).")] = None,
+    list_all: Annotated[bool, typer.Option("--list", help="List recent checkpoints.")] = False,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Print the latest (or given) checkpoint, ready to paste into a new agent session."""
+    k = _kernel(root)
+    if list_all:
+        t = Table(border_style="cyan")
+        for col in ("id", "when", "tokens", "goal"):
+            t.add_column(col)
+        for cp in k.db.list_checkpoints(20):
+            t.add_row(str(cp["id"]), _ago(cp["created_at"]), str(cp["tokens"]), Text(cp["goal"][:80]))
+        console.print(t)
+        return
+    r = k.resume_session(checkpoint_id)
+    if as_json or not r.get("ok"):
+        _print_json(r)
+        if not r.get("ok"):
+            raise typer.Exit(1)
+        return
+    console.print(Panel(Text(r["summary"]), title=f"checkpoint #{r['id']} · {_ago(r['created_at'])} · {r['tokens']} tokens",
+                        title_align="left", border_style="cyan"))
+    for sc in r["scars_on_files"]:
+        console.print(f"[{SEV_STYLE.get(sc['severity'], '')}]scar\\[{sc['severity']}][/] {escape(sc['file'])}: {escape(sc['error'])}")
+
+
+@app.command()
+def budget(
+    session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session id (default: most recent).")] = None,
+    all_sessions: Annotated[bool, typer.Option("--all", help="Aggregate every session.")] = False,
+    threshold: Annotated[Optional[int], typer.Option("--threshold", help="Set the per-session token budget.")] = None,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Context-budget profiler: tokens pushed into the agent per session, MCP tool, file and query."""
+    k = _kernel(root)
+    if threshold is not None:
+        console.print(f"[green]budget threshold set to {k.set_budget_threshold(threshold):,} tokens per session[/]")
+    r = k.budget_report(session, all_sessions)
+    if as_json:
+        _print_json(r)
+        return
+    pct = f" ({r['pct']}% of {r['threshold']:,})" if r["pct"] is not None else ""
+    style = "red" if (r["pct"] or 0) >= 100 else "dark_orange" if (r["pct"] or 0) >= 80 else "green"
+    console.print(Panel.fit(f"session [bold]{escape(r['session'])}[/] · [{style}]{r['used']:,} tokens{pct}[/] · {r['calls']} tool calls",
+                            title="context budget", border_style=style))
+    t = Table(title="by MCP tool", border_style="cyan")
+    for col in ("tool", "calls", "tokens", "peak"):
+        t.add_column(col, justify="left" if col == "tool" else "right")
+    for row in r["by_tool"]:
+        t.add_row(Text(row["tool"]), str(row["calls"]), f"{row['tokens']:,}", f"{row['peak']:,}")
+    console.print(t)
+    if r["top_files"]:
+        t = Table(title="heaviest files", border_style="violet")
+        t.add_column("file")
+        t.add_column("tokens", justify="right")
+        for row in r["top_files"]:
+            t.add_row(Text(row["file"]), f"{row['tokens']:,}")
+        console.print(t)
+    for q in r["top_queries"][:10]:
+        console.print(f"[cyan]{q['tokens']:>7,}[/] {escape(' '.join(q['query'].split())[:100])}")
+    if not r["calls"]:
+        console.print("[dim]No MCP tool usage recorded yet for this session.[/]")
+
+
+@app.command()
+def policy(
+    init_: Annotated[bool, typer.Option("--init", help="Write the default policy to .aether/policy.json.")] = False,
+    check: Annotated[Optional[str], typer.Option("--check", help="Explain the rules that apply to a path.")] = None,
+    deny: Annotated[Optional[list[str]], typer.Option("--deny", help="Add a deny glob.")] = None,
+    read_only: Annotated[Optional[list[str]], typer.Option("--read-only", help="Add a read-only glob.")] = None,
+    allow_cmd: Annotated[Optional[list[str]], typer.Option("--allow-cmd", help="Allow a command prefix.")] = None,
+    scan_ignore: Annotated[Optional[list[str]], typer.Option("--scan-ignore", help="Skip a glob in the pre-commit guard.")] = None,
+    remove: Annotated[Optional[list[str]], typer.Option("--remove", help="Remove a glob/prefix from every list.")] = None,
+    root: RootOpt = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Show or edit the permission sandbox (.aether/policy.json)."""
+    k = _kernel(root)
+    pol = k.policy
+    changed = init_ and pol.source == "default"
+    for value, bucket in ((deny, pol.deny), (read_only, pol.read_only), (allow_cmd, pol.allowed_commands),
+                          (scan_ignore, pol.scan_ignore)):
+        for v in value or []:
+            if v not in bucket:
+                bucket.append(v)
+                changed = True
+    for v in remove or []:
+        for bucket in (pol.deny, pol.read_only, pol.allowed_commands, pol.scan_ignore):
+            if v in bucket:
+                bucket.remove(v)
+                changed = True
+    if changed:
+        console.print(f"[green]policy saved[/] -> {k.save_policy(pol)}")
+    if check:
+        _print_json(k.check_path_policy(check))
+        return
+    if as_json:
+        _print_json({**pol.to_dict(), "source": pol.source})
+        return
+    t = Table(title=f"policy · {escape(pol.source)}", title_style="bold cyan", border_style="cyan", show_lines=False)
+    t.add_column("rule")
+    t.add_column("entries")
+    t.add_row("deny", Text("\n".join(pol.deny) or "-"))
+    t.add_row("read_only", Text("\n".join(pol.read_only) or "-"))
+    t.add_row("allowed_commands", Text(", ".join(pol.allowed_commands) or "-"))
+    t.add_row("scan_ignore", Text("\n".join(pol.scan_ignore) or "-"))
+    console.print(t)
+
+
+@app.command("install-hooks")
+def install_hooks(
+    uninstall: Annotated[bool, typer.Option("--uninstall", help="Remove the hook (restores a previous one).")] = False,
+    status: Annotated[bool, typer.Option("--status", help="Only report whether the hook is installed.")] = False,
+    root: RootOpt = None,
+) -> None:
+    """Install a git pre-commit hook that blocks secrets / prompt injections in staged lines (<150 ms)."""
+    from aether_core.hooks import hook_status, install_hook, uninstall_hook
+    from aether_core.kernel import find_project_root
+
+    project = (root or find_project_root()).resolve()
+    try:
+        if status:
+            _print_json(hook_status(project))
+            return
+        r = uninstall_hook(project) if uninstall else install_hook(project)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    if not r["ok"]:
+        console.print(f"[yellow]{r['error']}[/]")
+        raise typer.Exit(1)
+    if uninstall:
+        console.print(f"[green]removed[/] {r['path']}" + (" (previous hook restored)" if r["restored_previous_hook"] else ""))
+    else:
+        console.print(f"[green]pre-commit hook installed[/] -> {r['path']}"
+                      + (" · existing hook chained as pre-commit.local" if r["chained_existing_hook"] else ""))
+        console.print("[dim]Test it: aether scan --staged · bypass once: git commit --no-verify[/]")
 
 
 # ---------------------------------------------------------------------------- team brain & plugins

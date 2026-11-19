@@ -100,13 +100,17 @@ def create_app(kernel: AetherKernel | None = None, root: Path | str | None = Non
     @app.get("/api/graph")
     async def graph(limit: int = Query(default=800, ge=1, le=5000)) -> dict[str, Any]:
         g = await asyncio.to_thread(k.db.file_graph, limit)
+        spots = await asyncio.to_thread(k.hotspot_map)
+        risk = {(h.repo, h.file): h.risk_score for h in spots}
+        pol = k.policy
         nodes = [
             {
                 "id": int(n["id"]), "key": f"{n['repo_name']}:{n['path']}", "path": n["path"], "repo": n["repo_name"],
                 "language": n["language"], "lines": int(n["line_count"]), "tokens": int(n["token_estimate"]),
-                "symbols": int(n["node_count"]), "scars": int(n["scar_count"]),
+                "symbols": int(n["node_count"]), "scars": int(n["scar_count"]), "routes": int(n["route_count"]),
+                "risk": float(risk.get((n["repo_name"], n["path"]), 0.0)),
             }
-            for n in g["nodes"]
+            for n in g["nodes"] if pol.can_read(n["path"])
         ]
         edges = [{"source": int(e["src"]), "target": int(e["dst"]), "kind": e["kind"], "weight": int(e["weight"])} for e in g["edges"]]
         return {"nodes": nodes, "edges": edges, "repos": [r["name"] for r in k.db.list_repos()]}
@@ -116,6 +120,8 @@ def create_app(kernel: AetherKernel | None = None, root: Path | str | None = Non
         f = k.db.file_by_path(path, repo)
         if f is None:
             raise HTTPException(404, "file not indexed")
+        if not k.policy.can_read(f.path):
+            raise HTTPException(403, "denied by .aether/policy.json")
         nodes = k.db.nodes_for_file(f.id)
         symbols = [{"kind": n.kind, "name": n.name, "signature": n.signature, "line": n.start_line}
                    for n in nodes if n.kind != "module"][:60]
@@ -152,6 +158,23 @@ def create_app(kernel: AetherKernel | None = None, root: Path | str | None = Non
     @app.get("/api/swarm")
     async def swarm() -> list[dict[str, Any]]:
         return k.db.list_swarm_runs(20)
+
+    @app.get("/api/hotspots")
+    async def hotspots(limit: int = Query(default=20, ge=1, le=500)) -> dict[str, Any]:
+        return await asyncio.to_thread(k.get_code_hotspots, limit)
+
+    @app.get("/api/budget")
+    async def budget(session: str | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(k.budget_report, session)
+
+    @app.get("/api/policy")
+    async def policy() -> dict[str, Any]:
+        return {**k.policy.to_dict(), "source": k.policy.source}
+
+    @app.get("/api/checkpoints")
+    async def checkpoints() -> list[dict[str, Any]]:
+        masked, _ = k.vault.mask_obj(k.db.list_checkpoints(20))
+        return masked
 
     # ------------------------------------------------------------------ mutating API (token-protected)
     @app.post("/api/query", dependencies=[Depends(require_token)])

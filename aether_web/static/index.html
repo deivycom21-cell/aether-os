@@ -100,14 +100,33 @@ button:disabled { opacity: 0.4; cursor: wait; }
 #legend { position: fixed; left: 50%; transform: translateX(-50%); bottom: 16px; display: flex; gap: 14px; z-index: 3; color: var(--muted); font-size: 10px; letter-spacing: 0.08em; flex-wrap: wrap; justify-content: center; max-width: 34vw; }
 #legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--c); box-shadow: 0 0 8px var(--c); vertical-align: -1px; }
 #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 20; background: var(--bg); color: var(--cyan); font-family: var(--display); letter-spacing: 0.3em; transition: opacity 0.6s; }
+#radar { display: flex; gap: 4px; align-items: center; }
+#radar .lbl { color: var(--muted); font-size: 10px; letter-spacing: 0.14em; margin-right: 4px; }
+#radar button, #audio-btn { padding: 4px 9px; font-size: 10px; border-color: var(--line); color: var(--muted); }
+#radar button.on { border-color: var(--cyan); color: #001014; background: var(--cyan); box-shadow: 0 0 12px rgba(0,240,255,0.45); }
+#radar button[data-filter="HOTSPOTS"].on { background: var(--red); border-color: var(--red); box-shadow: 0 0 12px rgba(244,63,94,0.5); }
+#radar button[data-filter="SCARS"].on { background: var(--amber); border-color: var(--amber); box-shadow: 0 0 12px rgba(245,158,11,0.5); }
+#radar button[data-filter="ROUTES"].on { background: var(--violet); border-color: var(--violet); color: #fff; box-shadow: 0 0 12px rgba(139,92,246,0.5); }
+#audio-btn.on { border-color: var(--green); color: var(--green); box-shadow: 0 0 10px rgba(16,185,129,0.35); }
+#radar-count { color: var(--muted); font-size: 10px; min-width: 52px; letter-spacing: 0.08em; }
+#budget-alert { position: fixed; top: 60px; left: 50%; transform: translateX(-50%) translateY(-12px); z-index: 8; opacity: 0; pointer-events: none;
+  border: 1px solid var(--red); background: rgba(40, 6, 14, 0.92); color: #ffd5dc; padding: 8px 16px; border-radius: 4px; letter-spacing: 0.08em;
+  font-size: 11px; box-shadow: 0 0 28px rgba(244,63,94,0.45); transition: opacity 0.3s, transform 0.3s; text-transform: uppercase; }
+#budget-alert.show { opacity: 1; transform: translateX(-50%) translateY(0); animation: alarm 1s ease-in-out 4; }
+#budget-alert.approaching { border-color: var(--amber); color: #ffe7c2; background: rgba(40, 26, 4, 0.92); box-shadow: 0 0 28px rgba(245,158,11,0.4); }
+@keyframes alarm { 50% { box-shadow: 0 0 6px rgba(244,63,94,0.2); } }
+.kpi .bar { height: 3px; background: #111827; margin-top: 6px; border-radius: 2px; overflow: hidden; }
+.kpi .bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--cyan), var(--violet)); transition: width 0.6s, background 0.3s; }
+.kpi.warn .bar i { background: var(--amber); } .kpi.over .bar i { background: var(--red); } .kpi.over .value { color: var(--red); }
 ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: rgba(0,240,255,0.18); border-radius: 3px; }
 
 @media (max-width: 1100px) {
-  #legend { display: none; }
+  #legend { display: none; } #radar .lbl, #radar-count { display: none; }
   #detail { left: 16px; top: auto; bottom: 240px; }
 }
 @media (max-width: 760px) {
-  header { padding: 0 16px; } .crumb { display: none; }
+  header { padding: 0 16px; gap: 8px; } .crumb, .renderer-tag { display: none; }
+  #radar button, #audio-btn { padding: 3px 5px; font-size: 9px; }
   #kpis { left: 16px; right: 16px; width: auto; }
   #kpis .kpi:not(.hero):nth-child(n+6) { display: none; }
   #feed { top: auto; left: 16px; right: 16px; width: auto; bottom: 16px; height: 150px; }
@@ -121,11 +140,17 @@ button:disabled { opacity: 0.4; cursor: wait; }
 <canvas id="scene"></canvas>
 <div class="scanlines"></div><div class="vignette"></div>
 <div id="boot">AETHER//OS · BOOTING NEURAL GRAPH</div>
+<div id="budget-alert" role="alert"></div>
 
 <header>
   <div class="logo">AETHER<span>//</span>OS</div>
   <div class="crumb">Digital twin · <b id="project">—</b> · v__AETHER_VERSION__</div>
   <div class="spacer"></div>
+  <div id="radar"><span class="lbl">RADAR</span>
+    <button data-filter="ALL" class="on">ALL</button><button data-filter="HOTSPOTS">HOTSPOTS</button>
+    <button data-filter="SCARS">SCARS</button><button data-filter="ROUTES">ROUTES</button>
+    <span id="radar-count"></span></div>
+  <button id="audio-btn" title="Web Audio synth for live events">AUDIO: OFF</button>
   <div class="renderer-tag" id="renderer">—</div>
   <div class="status"><div class="dot" id="ws-dot"></div><span id="ws-label">connecting</span></div>
 </header>
@@ -142,6 +167,8 @@ button:disabled { opacity: 0.4; cursor: wait; }
     <div class="kpi"><div class="label">Secrets blocked</div><div class="value c-green" id="k-secrets">0</div></div>
     <div class="kpi"><div class="label">Queries</div><div class="value c-cyan" id="k-queries">0</div></div>
     <div class="kpi"><div class="label">Injections</div><div class="value c-red" id="k-inj">0</div></div>
+    <div class="kpi hero" id="kpi-budget"><div class="label">Context budget <span id="k-budget-session"></span></div>
+      <div class="value" id="k-budget" style="font-size:20px">0%</div><div class="bar"><i id="k-budget-bar"></i></div></div>
   </div>
   <canvas id="spark"></canvas>
 </section>
@@ -170,6 +197,7 @@ button:disabled { opacity: 0.4; cursor: wait; }
 <div id="legend">
   <span style="--c:#00f0ff">CONTEXT</span><span style="--c:#f59e0b">SCAR</span><span style="--c:#10b981">SECRET BLOCKED</span>
   <span style="--c:#f43f5e">INJECTION</span><span style="--c:#8b5cf6">SWARM</span><span style="--c:#e0f2fe">SNAPSHOT</span>
+  <span style="--c:#fb7185">HEAL</span><span style="--c:#ef4444">BUDGET</span>
 </div>
 <div id="tooltip"></div>
 
@@ -179,6 +207,8 @@ const EVENT_COLORS = {
   CONTEXT_QUERY: "#00f0ff", SCAR_TRIGGERED: "#f59e0b", SCAR_RECORDED: "#fbbf24", SECRET_BLOCKED: "#10b981",
   INJECTION_DETECTED: "#f43f5e", SWARM_STEP: "#8b5cf6", SNAPSHOT_CREATED: "#e0f2fe", ROLLBACK: "#f59e0b",
   INDEX_UPDATED: "#6366f1", IMPACT_ANALYSIS: "#a78bfa", SECURITY_SCAN: "#34d399", PLUGIN_RUN: "#64748b", BRAIN_SYNC: "#38bdf8",
+  HEAL_CONTEXT: "#fb7185", HEAL_ATTEMPT: "#f472b6", RULES_SYNCED: "#22d3ee", CHECKPOINT_SAVED: "#5eead4",
+  BUDGET_WARNING: "#ef4444", POLICY_BLOCKED: "#e879f9", DOCS_GENERATED: "#93c5fd", ANALYSIS: "#c4b5fd",
 };
 const LANG_COLORS = {
   python: "#00f0ff", typescript: "#8b5cf6", javascript: "#c084fc", go: "#2dd4bf", rust: "#fb923c", markdown: "#64748b",
@@ -202,7 +232,8 @@ const G = { nodes: [], edges: [], byKey: new Map(), byPath: new Map(), byId: new
 function buildGraph(data) {
   const repos = data.repos.length ? data.repos : [...new Set(data.nodes.map(n => n.repo))];
   G.nodes = data.nodes.map((n, i) => ({ ...n, i, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, flash: 0, flashColor: [1, 1, 1],
-    base: hexToRgb(n.scars ? "#f59e0b" : (LANG_COLORS[n.language] || "#94a3b8")),
+    base: hexToRgb(n.scars ? "#f59e0b" : (LANG_COLORS[n.language] || "#94a3b8")), vis: 1, tint: null,
+    risk: n.risk || 0, routes: n.routes || 0,
     size: 1.6 + Math.min(4.2, Math.log2(1 + n.symbols) * 0.9) }));
   G.byKey.clear(); G.byPath.clear(); G.byId.clear(); G.adj.clear(); G.clusters.clear();
   G.nodes.forEach(n => { G.byKey.set(n.key, n.i); G.byId.set(n.id, n.i); if (!G.byPath.has(n.path)) G.byPath.set(n.path, n.i); });
@@ -231,7 +262,77 @@ function buildGraph(data) {
   G.nodes.forEach(n => { const c = G.clusters.get(n.cluster) || [0, 0, 0];
     n.x = c[0] + (Math.random() - 0.5) * 30; n.y = c[1] + (Math.random() - 0.5) * 30; n.z = c[2] + (Math.random() - 0.5) * 30; });
   G.alpha = 1;
+  applyRadar();
 }
+
+/* ------------------------------------------------------------------ radar filters */
+const RADAR_MODES = ["ALL", "HOTSPOTS", "SCARS", "ROUTES"];
+let RADAR = (() => { const h = new URLSearchParams(location.hash.slice(1)).get("radar"); return RADAR_MODES.includes((h || "").toUpperCase()) ? h.toUpperCase() : "ALL"; })();
+function hotspotThreshold() {
+  const risks = G.nodes.map(n => n.risk).filter(r => r > 0).sort((a, b) => a - b);
+  if (!risks.length) return Infinity;
+  return Math.max(35, risks[Math.floor(risks.length * 0.85)] || 0);
+}
+function applyRadar() {
+  const hot = hotspotThreshold(); let count = 0;
+  for (const n of G.nodes) {
+    const match = RADAR === "ALL" || (RADAR === "HOTSPOTS" && n.risk >= hot) || (RADAR === "SCARS" && n.scars > 0) || (RADAR === "ROUTES" && n.routes > 0);
+    n.vis = match ? 1 : 0.14; if (match) count++;
+    n.tint = RADAR === "HOTSPOTS" && match ? hexToRgb(n.risk >= 70 ? "#f43f5e" : n.risk >= 50 ? "#fb923c" : "#f59e0b")
+      : RADAR === "ROUTES" && match ? hexToRgb("#8b5cf6") : null;
+  }
+  $("radar-count").textContent = RADAR === "ALL" ? `${G.nodes.length} files` : `${count} match`;
+}
+function setRadar(mode) {
+  RADAR = mode; document.querySelectorAll("#radar button").forEach(x => x.classList.toggle("on", x.dataset.filter === mode));
+  try { history.replaceState(null, "", mode === "ALL" ? location.pathname : `#radar=${mode.toLowerCase()}`); } catch (e) { /* file:// or sandboxed */ }
+  applyRadar();
+}
+document.querySelectorAll("#radar button").forEach(b => b.onclick = () => { setRadar(b.dataset.filter); blip(RADAR === "ALL" ? 520 : 760, 0.08, "triangle"); });
+document.querySelectorAll("#radar button").forEach(x => x.classList.toggle("on", x.dataset.filter === RADAR));
+function nodeColor(n) {
+  const base = n.tint || n.base, f = n.flash, v = n.vis;
+  return [(base[0] * (1 - f) + n.flashColor[0] * f) * Math.max(v, f), (base[1] * (1 - f) + n.flashColor[1] * f) * Math.max(v, f),
+    (base[2] * (1 - f) + n.flashColor[2] * f) * Math.max(v, f)];
+}
+function nodeScale(n) { return n.size * (1 + n.flash * 1.4) * (0.45 + 0.55 * Math.max(n.vis, n.flash)); }
+
+/* ------------------------------------------------------------------ audio (Web Audio API, zero assets) */
+let AC = null, MASTER = null;
+const SFX = {
+  CONTEXT_QUERY: [880, 0.09, "sine"], SCAR_TRIGGERED: [330, 0.18, "triangle"], SCAR_RECORDED: [392, 0.2, "triangle"],
+  SECRET_BLOCKED: [180, 0.22, "square"], INJECTION_DETECTED: [140, 0.3, "sawtooth"], SWARM_STEP: [660, 0.08, "triangle"],
+  SNAPSHOT_CREATED: [1046, 0.12, "sine"], ROLLBACK: [262, 0.25, "sine"], INDEX_UPDATED: [523, 0.06, "sine"],
+  IMPACT_ANALYSIS: [587, 0.1, "triangle"], HEAL_CONTEXT: [440, 0.16, "sawtooth"], HEAL_ATTEMPT: [494, 0.1, "triangle"],
+  CHECKPOINT_SAVED: [784, 0.14, "sine"], POLICY_BLOCKED: [220, 0.2, "square"], ANALYSIS: [698, 0.08, "sine"],
+};
+function blip(freq, dur = 0.1, type = "sine", when = 0, gain = 0.5) {
+  if (!AC) return;
+  const t = AC.currentTime + when, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t); o.frequency.exponentialRampToValueAtTime(freq * 1.5, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(gain, t + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(MASTER); o.start(t); o.stop(t + dur + 0.02);
+}
+function sonify(ev) {
+  if (!AC) return;
+  if (ev.type === "BUDGET_WARNING") { [0, 0.22, 0.44].forEach((d, i) => blip(i % 2 ? 620 : 880, 0.18, "square", d, 0.6)); return; }
+  const s = SFX[ev.type]; if (!s) return;
+  const lift = ev.type === "CONTEXT_QUERY" ? Math.min(1.8, 1 + Math.log10(1 + ((ev.payload || {}).saved_tokens || 0)) / 6) : 1;
+  blip(s[0] * lift, s[1], s[2]);
+}
+$("audio-btn").onclick = async () => {
+  const btn = $("audio-btn");
+  if (!AC) {
+    const Ctor = window.AudioContext || window.webkitAudioContext; if (!Ctor) { btn.textContent = "AUDIO: N/A"; return; }
+    AC = new Ctor(); MASTER = AC.createGain(); MASTER.gain.value = 0.12; MASTER.connect(AC.destination);
+  }
+  if (AC.state === "running" && btn.classList.contains("on")) { await AC.suspend(); btn.classList.remove("on"); btn.textContent = "AUDIO: OFF"; return; }
+  await AC.resume(); btn.classList.add("on"); btn.textContent = "AUDIO: ON"; blip(523, 0.08); blip(784, 0.12, "sine", 0.09);
+};
+
+/* ------------------------------------------------------------------ fly-to camera easing */
+const ease = (k) => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+const lerp3 = (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
 
 function stepLayout() {
   if (G.alpha < 0.004) return false;
@@ -360,14 +461,16 @@ function createThreeViz(THREE, OrbitControls, canvas) {
     if (!mesh) return;
     const hp = halo.geometry.attributes.position.array, hc = halo.geometry.attributes.color.array;
     G.nodes.forEach((n, i) => {
-      const s = n.size * (1 + n.flash * 1.4);
+      const s = nodeScale(n);
       dummy.position.set(n.x, n.y, n.z); dummy.scale.set(s, s, s); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix);
-      const f = n.flash;
-      const r = n.base[0] * (1 - f) + n.flashColor[0] * f, g = n.base[1] * (1 - f) + n.flashColor[1] * f, b = n.base[2] * (1 - f) + n.flashColor[2] * f;
+      const f = n.flash, [r, g, b] = nodeColor(n);
       tmpColor.setRGB(r, g, b); mesh.setColorAt(i, tmpColor);
       hp[i * 3] = n.x; hp[i * 3 + 1] = n.y; hp[i * 3 + 2] = n.z;
-      const k = 0.35 + f * 0.9; hc[i * 3] = r * k; hc[i * 3 + 1] = g * k; hc[i * 3 + 2] = b * k;
+      const k = (0.35 + f * 0.9) * (n.tint ? 1.4 : 1); hc[i * 3] = r * k; hc[i * 3 + 1] = g * k; hc[i * 3 + 2] = b * k;
     });
+    if (fly) { const k = Math.min(1, (performance.now() - fly.t0) / fly.ms), e = ease(k), n = G.nodes[fly.i], goal = [n.x, n.y, n.z];
+      const cam = lerp3(fly.fromCam, [goal[0] + fly.off[0], goal[1] + fly.off[1], goal[2] + fly.off[2]], e), tgt = lerp3(fly.fromTarget, goal, e);
+      camera.position.set(cam[0], cam[1], cam[2]); controls.target.set(tgt[0], tgt[1], tgt[2]); if (k >= 1) fly = null; }
     mesh.instanceMatrix.needsUpdate = true; if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     halo.geometry.attributes.position.needsUpdate = true; halo.geometry.attributes.color.needsUpdate = true;
     const lp = lines.geometry.attributes.position.array;
@@ -393,8 +496,15 @@ function createThreeViz(THREE, OrbitControls, canvas) {
   }
   function resize() { const w = window.innerWidth, h = window.innerHeight; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); }
   function reset() { const span = Math.max(260, ...[...G.clusters.values()].map(c => Math.abs(c[0]) * 1.6 + 120)); camera.position.set(0, span * 0.32, span * 1.15); controls.target.set(0, 0, 0); }
-  function focus(i) { const n = G.nodes[i]; controls.target.set(n.x, n.y, n.z); controls.autoRotate = false; }
-  canvas.addEventListener("pointerdown", () => { controls.autoRotate = false; });
+  let fly = null;
+  function focus(i) {
+    const n = G.nodes[i]; controls.autoRotate = false;
+    const dir = [camera.position.x - controls.target.x, camera.position.y - controls.target.y, camera.position.z - controls.target.z];
+    const len = Math.hypot(...dir) || 1, dist = 70 + n.size * 12;
+    fly = { i, t0: performance.now(), ms: 1100, fromCam: [camera.position.x, camera.position.y, camera.position.z],
+      fromTarget: [controls.target.x, controls.target.y, controls.target.z], off: dir.map(d => d / len * dist) };
+  }
+  canvas.addEventListener("pointerdown", () => { controls.autoRotate = false; fly = null; });
   return { name: "WEBGL · THREE.JS", setGraph, render, pick, resize, reset, focus };
 }
 
@@ -414,8 +524,11 @@ function createCanvasViz(canvas) {
     const x1 = x * cy - z * sy, z1 = x * sy + z * cy, y1 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
     const f = 700 / (700 + z2 + 400) * zoom; return [W / 2 + x1 * f * 1.4, H / 2 + y1 * f * 1.4, f, z2];
   }
+  let fly = null;
   function render(parts) {
     if (auto) yaw += 0.0016;
+    if (fly) { const k = Math.min(1, (performance.now() - fly.t0) / fly.ms), e = ease(k), n = G.nodes[fly.i];
+      center = lerp3(fly.from, [n.x, n.y, n.z], e); zoom = fly.z0 + (fly.z1 - fly.z0) * e; if (k >= 1) fly = null; }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.fillStyle = "#05070d"; ctx.fillRect(0, 0, W, H);
     for (const s of stars) { ctx.fillStyle = `rgba(59,74,102,${s[2]})`; ctx.fillRect(s[0] * W, s[1] * H, 1.2, 1.2); }
     proj = G.nodes.map(n => project([n.x, n.y, n.z]));
@@ -427,8 +540,8 @@ function createCanvasViz(canvas) {
     ctx.beginPath(); ctx.arc(c[0], c[1], cr * 3, 0, Math.PI * 2); ctx.fill();
     const order = G.nodes.map((_, i) => i).sort((a, b) => proj[b][3] - proj[a][3]);
     for (const i of order) { const n = G.nodes[i], p = proj[i], f = n.flash;
-      const col = [n.base[0] * (1 - f) + n.flashColor[0] * f, n.base[1] * (1 - f) + n.flashColor[1] * f, n.base[2] * (1 - f) + n.flashColor[2] * f];
-      const r = Math.max(1.2, n.size * p[2] * 1.5 * (1 + f));
+      const col = nodeColor(n);
+      const r = Math.max(1.2, nodeScale(n) * p[2] * 1.5);
       ctx.fillStyle = css(col, 0.18 + f * 0.4); ctx.beginPath(); ctx.arc(p[0], p[1], r * 2.6, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = css(col, 0.95); ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, Math.PI * 2); ctx.fill(); }
     for (const q of parts) { const p = project(q.p); ctx.fillStyle = css(q.c, 0.9); ctx.beginPath(); ctx.arc(p[0], p[1], 2.6 * p[2] * (0.5 + q.s), 0, Math.PI * 2); ctx.fill(); }
@@ -438,7 +551,7 @@ function createCanvasViz(canvas) {
     proj.forEach((p, i) => { const dx = p[0] - (x - r.left), dy = p[1] - (y - r.top), d = dx * dx + dy * dy; if (d < bd) { bd = d; best = i; } }); return best; }
   function resize() { dpr = Math.min(2, window.devicePixelRatio || 1); W = window.innerWidth; H = window.innerHeight; canvas.width = W * dpr; canvas.height = H * dpr; }
   function reset() { yaw = 0; pitch = -0.3; zoom = 1; center = [0, 0, 0]; auto = true; }
-  function focus(i) { const n = G.nodes[i]; center = [n.x, n.y, n.z]; auto = false; }
+  function focus(i) { auto = false; fly = { i, t0: performance.now(), ms: 1000, from: [...center], z0: zoom, z1: Math.max(zoom, 2.4) }; }
   return { name: "CANVAS 2D · FALLBACK", setGraph() {}, render, pick, resize, reset, focus };
 }
 
@@ -455,7 +568,8 @@ let viz = null;
 const counters = {};
 function setCounter(id, value, formatter = fmt) {
   const node = $(id); const from = counters[id] ?? 0; counters[id] = value; const t0 = performance.now();
-  const tick = (now) => { const k = Math.min(1, (now - t0) / 600), v = from + (value - from) * (1 - Math.pow(1 - k, 3));
+  // rAF timestamps can precede t0 (frame start < performance.now()), so clamp k to [0, 1]
+  const tick = (now) => { const k = Math.max(0, Math.min(1, (now - t0) / 600)), v = from + (value - from) * (1 - Math.pow(1 - k, 3));
     node.textContent = formatter(v); if (k < 1) requestAnimationFrame(tick); };
   requestAnimationFrame(tick);
 }
@@ -466,6 +580,9 @@ function renderStats(s) {
   setCounter("k-files", s.files_indexed); setCounter("k-nodes", s.graph.nodes); setCounter("k-scars", s.graph.scars);
   setCounter("k-secrets", s.secrets_blocked); setCounter("k-queries", s.queries); setCounter("k-inj", s.injections_detected);
   const up = Math.round(s.uptime_s); $("uptime").textContent = `uptime ${Math.floor(up / 60)}m ${up % 60}s`;
+  if (s.budget) { const b = s.budget, pct = b.pct || 0; setCounter("k-budget", pct, v => `${v.toFixed(1)}% · ${fmt(b.used)}/${fmt(b.threshold)}`);
+    $("k-budget-bar").style.width = Math.min(100, pct) + "%"; $("kpi-budget").className = "kpi hero" + (pct >= 100 ? " over" : pct >= 80 ? " warn" : "");
+    $("k-budget-session").textContent = b.session ? "· " + String(b.session).slice(-14) : ""; }
   drawSpark(s.series || []);
 }
 function drawSpark(series) {
@@ -495,6 +612,14 @@ function describe(ev) {
     case "SECURITY_SCAN": return `scan ${p.risk_level} · ${p.files} files · ${p.secrets} secrets · ${p.injections} injections`;
     case "PLUGIN_RUN": return `plugin ${p.plugin} ${p.ok ? "ok" : "failed"} · ${p.duration_ms}ms`;
     case "BRAIN_SYNC": return `team brain ${p.direction} · ${p.scars ?? p.scars_imported ?? 0} scars`;
+    case "HEAL_CONTEXT": return `heal ${p.status} · ${p.errors} error(s) · ${(p.files || []).join(", ") || "no project frames"}`;
+    case "HEAL_ATTEMPT": return `heal attempt ${p.attempt} · ${p.model || ""} ${p.ok === undefined ? p.step || "" : p.ok ? "passed" : "failed"}`;
+    case "RULES_SYNCED": return `agent rules synced → ${(p.files || []).join(", ") || "unchanged"} · ~${p.tokens} tok`;
+    case "CHECKPOINT_SAVED": return `checkpoint #${p.id} "${p.goal}" · ${p.tokens} tok`;
+    case "BUDGET_WARNING": return `context budget ${p.level} · ${p.pct}% (${fmt(p.used)}/${fmt(p.threshold)}) after ${p.tool}`;
+    case "POLICY_BLOCKED": return `policy blocked ${p.action}${p.file ? " on " + p.file : ""}`;
+    case "DOCS_GENERATED": return `docs → ${p.file} · ${p.modules} modules · ${p.endpoints} endpoints`;
+    case "ANALYSIS": return `${String(p.kind || "").replace(/_/g, " ")} · ${Object.entries(p).filter(([k]) => k !== "kind").map(([k, v]) => k + " " + v).join(" · ")}`.slice(0, 180);
     default: return JSON.stringify(p).slice(0, 160);
   }
 }
@@ -570,6 +695,7 @@ function onHover(e) {
   if (i < 0) { tip.style.display = "none"; return; }
   const n = G.nodes[i]; tip.replaceChildren(el("div", "p", n.path), el("div", "m", `${n.repo} · ${n.language} · ${n.symbols} symbols · ${n.lines} lines · ~${fmt(n.tokens)} tok`));
   if (n.scars) tip.appendChild(el("div", "c-amber", `⚠ ${n.scars} scar(s)`));
+  if (n.risk) tip.appendChild(el("div", n.risk >= 50 ? "c-red" : "m", `risk ${n.risk.toFixed(0)}/100${n.routes ? ` · ${n.routes} route(s)` : ""}`));
   tip.style.display = "block"; tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 350) + "px"; tip.style.top = (e.clientY + 14) + "px";
 }
 
@@ -585,7 +711,8 @@ function connect() {
     if (msg.type === "HELLO") { renderStats(msg.stats); feedList.replaceChildren(); feedCount = 0; msg.events.forEach(addFeed); }
     else if (msg.type === "STATS") renderStats(msg.stats);
     else if (msg.type === "EVENT") {
-      addFeed(msg.event); animateEvent(msg.event);
+      addFeed(msg.event); animateEvent(msg.event); sonify(msg.event);
+      if (msg.event.type === "BUDGET_WARNING") showBudgetAlert(msg.event.payload || {});
       if (["SNAPSHOT_CREATED", "ROLLBACK"].includes(msg.event.type)) loadSnapshots();
       if (msg.event.type === "INDEX_UPDATED") refreshGraph();
     }
@@ -593,10 +720,18 @@ function connect() {
 }
 setInterval(() => { if (ws && ws.readyState === 1) ws.send("ping"); }, 20000);
 
+let alertTimer = null;
+function showBudgetAlert(p) {
+  const box = $("budget-alert");
+  box.textContent = `⚠ Context budget ${p.level || "warning"} · ${p.pct}% of ${fmt(p.threshold || 0)} tokens · session ${String(p.session || "").slice(-14)} · checkpoint & start fresh`;
+  box.className = "show" + (p.level === "approaching" ? " approaching" : "");
+  clearTimeout(alertTimer); alertTimer = setTimeout(() => { box.className = ""; }, 9000);
+}
+
 let graphTimer = null;
 function refreshGraph() { clearTimeout(graphTimer); graphTimer = setTimeout(async () => {
   try { const prev = new Map(G.nodes.map(n => [n.key, [n.x, n.y, n.z]])); buildGraph(await api("/api/graph"));
-    G.nodes.forEach(n => { const p = prev.get(n.key); if (p) { [n.x, n.y, n.z] = p; } }); if (prev.size) G.alpha = 0.3; viz.setGraph(); } catch (e) { console.warn(e); }
+    G.nodes.forEach(n => { const p = prev.get(n.key); if (p) { [n.x, n.y, n.z] = p; } }); if (prev.size) G.alpha = 0.3; applyRadar(); viz.setGraph(); } catch (e) { console.warn(e); }
 }, 800); }
 
 /* ------------------------------------------------------------------ boot */
