@@ -100,6 +100,6 @@ def render_share_card(m: dict[str, Any]) -> str:
 <rect x="64" y="542" width="1072" height="10" rx="5" fill="#111827"/>
 <rect x="64" y="542" width="{bar_w:.1f}" height="10" rx="5" fill="url(#bar)" filter="url(#glow)"/>
 <g opacity="0.9">{_sparkline(series, 820, 494, 316, 34)}</g>
-<text x="64" y="596" fill="{MUTED}" font-family="{MONO}" font-size="15">github.com/aether-os/aether-os · metrics measured locally, nothing leaves the machine</text>
+<text x="64" y="596" fill="{MUTED}" font-family="{MONO}" font-size="15">github.com/deivycom21-cell/aether-os · metrics measured locally, nothing leaves the machine</text>
 </svg>
 """

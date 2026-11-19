@@ -145,6 +145,7 @@ web API only call the kernel. Nothing new talks to the network.
    rules_sync.py    <!-- AETHER:START --> … <!-- AETHER:END --> upsert (CRLF-preserving, atomic replace)
    share_card.py    1200×630 SVG, system fonts only
    mcp_install.py   claude · cursor · windsurf · vscode(cline/roo) · zed(JSONC) · opencode
+   setup_wizard.py  prereqs · project guard · IDE detection (PATH + config dirs) · stdio initialize/tools/list check
    hotspots.py      risk = 100·(0.30·cx + 0.25·fan_in + 0.25·churn + 0.20·scars), each log-normalised
    sessions.py      checkpoint builder (progressive shrinking until ≤ 400 tokens)
    precommit.py     git diff --cached -U0 → added lines only → detect_secrets + injection detector

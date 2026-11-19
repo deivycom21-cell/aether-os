@@ -47,7 +47,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "anthropic>=0.60"]
 aether = "aether_core.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/aether-os/aether-os"
+Homepage = "https://github.com/deivycom21-cell/aether-os"
 
 [tool.setuptools]
 include-package-data = true

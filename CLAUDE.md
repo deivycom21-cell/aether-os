@@ -14,6 +14,8 @@ a permission policy, a pre-commit guard, a context-budget profiler and three plu
    brain or the dashboard goes through `SecretVault.mask/mask_obj`. The vault lives in RAM only.
 3. **Windows-first portability.** Use `pathlib.Path`, explicit `encoding="utf-8"`, `as_posix()` for stored
    paths, no shell scripts, no POSIX-only calls. Subprocesses use argument lists, never `shell=True`.
+   Sole exception: the thin bootstrap installers `install.ps1` / `install.sh` (install uv + the package,
+   then call `aether setup`); all setup logic lives in Python (`setup_wizard.py`).
 4. **No placeholders.** No `TODO`, bare `pass` bodies, fake data or mocks in production code.
 5. **Telemetry never breaks the caller.** Event publishing / persistence failures are swallowed.
 6. **Destructive operations are reversible.** Rollback takes a safety snapshot first; swarm merges and
@@ -26,8 +28,9 @@ a permission policy, a pre-commit guard, a context-budget profiler and three plu
 ```powershell
 uv venv .venv --python 3.12
 uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
-.\.venv\Scripts\python.exe -m pytest              # full suite (115 tests, ~5 min on Windows; needs git on PATH)
+.\.venv\Scripts\python.exe -m pytest              # full suite (118 tests, ~5 min on Windows; needs git on PATH)
 .\.venv\Scripts\python.exe -m pytest tests\test_security_firewall.py -q
+.\.venv\Scripts\aether.exe setup                  # one-command onboarding: index, MCP, hook, rules, live check
 .\.venv\Scripts\aether.exe init                   # index this repo
 .\.venv\Scripts\aether.exe query "how are secrets masked"
 .\.venv\Scripts\aether.exe web --open             # http://127.0.0.1:7777
@@ -46,13 +49,14 @@ aether_core/   kernel.py (facade) · database.py · ast_indexer.py · context_en
                event_bus.py · git_sync.py · mcp_server.py · cli.py
                v0.2: policy.py · healer.py · rules_sync.py · share_card.py · mcp_install.py · hotspots.py
                sessions.py · budget.py · precommit.py · hooks.py · semantic_diff.py · dead_code.py
-               test_gen.py · docs_gen.py
+               test_gen.py · docs_gen.py · setup_wizard.py (IDE detection + live MCP handshake)
 aether_swarm/  router.py (tiers + Ollama probe) · llm.py (BYOK Anthropic SDK / Ollama) · orchestrator.py
 aether_web/    server.py (FastAPI + /ws/telemetry) · static/index.html (Three.js + Canvas2D fallback)
 aether_tui/    app.py (Textual)
 plugins/       base.py (contract + safe loader) · docker_inspector · git_history_scars · env_shield
                v0.2: db_schema_inspector · runtime_log_watcher · dep_auditor
 benchmarks/    run_benchmark.py
+install.ps1 / install.sh   one-line bootstrap (uv -> uv tool install -> aether setup)
 tests/         10 suites (5 original + 5 test_v02_*), fixtures build a FastAPI backend + Next.js frontend in tmp dirs
 ```
 
@@ -107,6 +111,9 @@ Dependency direction: `cli/mcp/web/tui -> kernel -> {context_engine, ast_indexer
   CPython start-up and `git diff` on Windows.
 - CLI graph analyses (`hotspots`, `dead-code`, `docs`, `sync-rules`) re-index incrementally first; the kernel
   methods do not, so call `kernel.index()` in tests after writing files.
+- `find_project_root` never climbs to the home folder or a drive root (dotfiles repos in `~` exist);
+  `aether setup` also refuses folders without project markers unless `--here` is passed.
+- `aether setup`'s live handshake spawns the configured MCP command; a cold uv tool env can take ~45 s.
 - MCP `semantic_diff` is compact (signatures clipped, body edits counted, ≤25 files) to protect the budget.
 
 <!-- AETHER:START -->
