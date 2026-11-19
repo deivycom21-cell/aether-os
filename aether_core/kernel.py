@@ -67,10 +67,16 @@ class AetherConfig:
 
 
 def find_project_root(start: Path | None = None) -> Path:
-    """Walk up from ``start`` looking for ``.aether`` (then ``.git``); fall back to ``start``."""
+    """Walk up from ``start`` looking for ``.aether`` (then ``.git``); fall back to ``start``.
+
+    The walk stops below the home folder and the filesystem root: a dotfiles repo in ``~`` must never
+    turn the whole profile into "the project"."""
     start = (start or Path.cwd()).resolve()
+    home = Path.home().resolve()
     for marker in (AETHER_DIRNAME, ".git"):
         for candidate in (start, *start.parents):
+            if candidate == home or candidate.parent == candidate:
+                break
             if (candidate / marker).exists():
                 return candidate
     return start

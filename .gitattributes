@@ -1,0 +1,2 @@
+# POSIX shells choke on CRLF: keep the bootstrap installer LF everywhere.
+*.sh text eol=lf

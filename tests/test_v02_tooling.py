@@ -279,3 +279,59 @@ def test_cli_smoke_for_new_commands(git_kernel: AetherKernel) -> None:
     gen = Path(root) / "tests" / "test_models_generated.py"
     _cli("gen-tests", "app/models.py", "--root", root)
     assert gen.is_file()
+
+
+# ---------------------------------------------------------------------------- one-command setup
+
+
+def test_setup_detects_clients_and_guards_non_projects(tmp_path: Path) -> None:
+    from aether_core.kernel import find_project_root
+    from aether_core.setup_wizard import check_prerequisites, choose_targets, detect_clients, looks_like_project
+
+    home, appdata = tmp_path / "home", tmp_path / "appdata"
+    (home / ".cursor").mkdir(parents=True)
+    (appdata / "Zed").mkdir(parents=True)
+    found = {d["key"]: d for d in detect_clients(home=home, env={"APPDATA": str(appdata)},
+                                                 which=lambda exe: "/bin/claude" if exe == "claude" else None)}
+    assert {k for k, d in found.items() if d["detected"]} == {"claude", "cursor", "zed"}
+    assert found["claude"]["evidence"] == ["claude on PATH"]
+    assert choose_targets(list(found.values())) == ["claude", "cursor", "zed"]
+    assert choose_targets([{**d, "detected": False} for d in found.values()]) == ["claude", "cursor"]
+
+    empty = tmp_path / "downloads"
+    empty.mkdir()
+    assert not looks_like_project(empty) and not looks_like_project(Path.home())
+    (empty / "package.json").write_text("{}", encoding="utf-8")
+    assert looks_like_project(empty)
+    assert find_project_root(empty) == empty.resolve()
+    git_check = next(p for p in check_prerequisites(which=lambda exe: None) if p["name"] == "git")
+    assert git_check["ok"] is False and git_check["fix"]
+    r = runner.invoke(cli_app, ["setup", "--root", str(tmp_path / "home")])
+    assert r.exit_code == 2 and "does not look like a project" in r.output
+
+
+def test_verify_mcp_server_reports_dead_commands() -> None:
+    from aether_core.setup_wizard import verify_mcp_server
+
+    dead = verify_mcp_server(sys.executable, ["-c", "import sys; sys.exit(3)"], timeout=20)
+    assert dead["ok"] is False and "exited with code 3" in dead["error"]
+    missing = verify_mcp_server(str(Path(sys.executable).with_name("no-such-python.exe")), [], timeout=5)
+    assert missing["ok"] is False and "could not start" in missing["error"]
+
+
+@requires_git
+def test_setup_cli_end_to_end(backend_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AETHER_OLLAMA_URL", "http://127.0.0.1:9")
+    git_init(backend_repo)
+    r = runner.invoke(cli_app, ["setup", "--client", "claude", "-t", "cursor", "--root", str(backend_repo)])
+    assert r.exit_code == 0, r.output
+    out = r.output.replace("\n", "")
+    assert "AetherOS is ready" in out and "16 tools" in out
+    entry = json.loads((backend_repo / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["aether"]
+    assert entry["command"] == sys.executable and entry["args"][-1] == str(backend_repo.resolve())
+    assert (backend_repo / ".cursor" / "mcp.json").is_file() and not (backend_repo / ".vscode").exists()
+    assert hook_status(backend_repo)["installed"]
+    assert "<!-- AETHER:START -->" in (backend_repo / "CLAUDE.md").read_text(encoding="utf-8")
+    assert (backend_repo / ".cursorrules").is_file()
+    again = runner.invoke(cli_app, ["setup", "-c", "claude", "--no-hooks", "--no-rules", "--no-verify", "--root", str(backend_repo)])
+    assert again.exit_code == 0 and "skipped (--no-hooks)" in again.output

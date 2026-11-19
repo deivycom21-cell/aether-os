@@ -407,7 +407,7 @@ def install_mcp(
     from aether_core.mcp_install import install, resolve_targets
 
     project = (root or find_project_root()).resolve()
-    command, args = sys.executable, ["-m", "aether_core.cli", "mcp", "--root", str(project)]
+    command, args = _mcp_entry(project)
     if print_only:
         typer.echo(json.dumps({"mcpServers": {"aether": {"command": command, "args": args}}}, indent=2))
         return
@@ -427,6 +427,146 @@ def install_mcp(
         console.print("[dim]More IDEs: aether install-mcp --all (Windsurf, Cline/Roo Code, Zed, OpenCode). "
                       "Aider: use `aether query \"...\" --json` via /run.[/]")
     if failed:
+        raise typer.Exit(1)
+
+
+def _mcp_entry(project: Path) -> tuple[str, list[str]]:
+    """The command every IDE config launches: this interpreter, pinned to the project root."""
+    return sys.executable, ["-m", "aether_core.cli", "mcp", "--root", str(project)]
+
+
+NEXT_STEPS = {
+    "claude": "Claude Code: run [bold]claude[/] in this folder and approve the 'aether' MCP server (check with /mcp)",
+    "cursor": "Cursor: Settings > MCP > enable 'aether' (or reload the window)",
+    "windsurf": "Windsurf: Cascade > MCP servers > refresh",
+    "vscode": "VS Code (Cline / Roo Code / Copilot): reload the window and start the 'aether' server",
+    "zed": "Zed: 'aether' starts with the next agent panel session",
+    "opencode": "OpenCode: restart opencode in this folder",
+}
+
+
+@app.command()
+def setup(
+    client: Annotated[Optional[list[str]], typer.Option("--client", "-c", "--target", "-t",
+                      help="Only these IDEs (claude | cursor | windsurf | vscode | zed | opencode | all). Default: auto-detect.")] = None,
+    install_all: Annotated[bool, typer.Option("--all", help="Register the MCP server for every supported IDE.")] = False,
+    link_repo: Annotated[Optional[list[Path]], typer.Option("--link-repo", "-l", help="Sibling repository to link (repeatable).")] = None,
+    no_hooks: Annotated[bool, typer.Option("--no-hooks", help="Do not install the pre-commit guard.")] = False,
+    no_rules: Annotated[bool, typer.Option("--no-rules", help="Do not write the live block into CLAUDE.md / .cursorrules.")] = False,
+    no_verify: Annotated[bool, typer.Option("--no-verify", help="Skip the end-to-end MCP handshake check.")] = False,
+    here: Annotated[bool, typer.Option("--here", help="Use the current folder even if it has no project markers.")] = False,
+    root: RootOpt = None,
+) -> None:
+    """One-command onboarding: prerequisites, index, MCP in every detected IDE, pre-commit guard, rules, live check."""
+    from aether_core.hooks import install_hook
+    from aether_core.kernel import AetherKernel, find_project_root
+    from aether_core.mcp_install import install, resolve_targets
+    from aether_core.setup_wizard import (check_prerequisites, choose_targets, detect_clients, is_ephemeral_interpreter,
+                                          looks_like_project, verify_mcp_server)
+
+    project = (root or find_project_root()).resolve()
+    console.print(Panel.fit(Text.from_markup(f"[bold cyan]AETHER//OS setup[/] v{__version__}\n"
+                                             f"project: [white]{escape(str(project))}[/]"), border_style="cyan"))
+    if not here and not looks_like_project(project):
+        console.print("[yellow]This folder does not look like a project[/] (no .git, pyproject.toml, package.json, ...).\n"
+                      "cd into your project and run [bold]aether setup[/] again, or pass [bold]--here[/] to use this folder.")
+        raise typer.Exit(2)
+    warnings: list[str] = []
+
+    console.rule("[cyan]1/6 prerequisites[/]")
+    prereqs = check_prerequisites()
+    for p in prereqs:
+        mark = "[green]ok[/]" if p["ok"] else ("[red]missing[/]" if p["required"] else "[yellow]missing[/]")
+        console.print(f"  {mark} {p['name']} [dim]{escape(p['detail'])}[/]"
+                      + (f"\n      fix: [bold]{escape(p['fix'])}[/]" if p["fix"] else ""))
+    if any(p["required"] and not p["ok"] for p in prereqs):
+        raise typer.Exit(1)
+    has_git = next(p["ok"] for p in prereqs if p["name"] == "git")
+    if not has_git:
+        warnings.append("git is missing: pre-commit guard, hotspot churn, semantic diff and swarm are unavailable")
+    if is_ephemeral_interpreter():
+        warnings.append("running from a temporary uvx environment; IDE configs may break after a cache clean. "
+                        "Install permanently: uv tool install aether-os")
+
+    console.rule("[cyan]2/6 code graph[/]")
+    k = AetherKernel(project)
+    for lr in link_repo or []:
+        entry = k.link_repo(lr)
+        console.print(f"  [violet]linked[/] {entry['name']} -> {escape(str(entry['path']))}")
+    with console.status("[cyan]Indexing the multi-repo graph...[/]"):
+        summary = k.index(run_plugins=True)
+    _index_report(summary)
+
+    console.rule("[cyan]3/6 MCP clients[/]")
+    try:
+        if client or install_all:
+            targets = resolve_targets(client, install_all)
+        else:
+            detected = detect_clients()
+            for d in detected:
+                state = "[green]detected[/]" if d["detected"] else "[grey50]not found[/]"
+                console.print(f"  {state} {d['label']} [dim]{escape(', '.join(d['evidence']))}[/]")
+            if not any(d["detected"] for d in detected):
+                console.print("  [dim]no IDE detected: writing Claude Code + Cursor configs[/]")
+            targets = resolve_targets(choose_targets(detected))
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+    command, args = _mcp_entry(project)
+    for r in install(project, targets, command, args):
+        if r["ok"]:
+            console.print(f"  [green]{r['label']}[/] {r['action']} -> {escape(r['path'])}")
+        else:
+            warnings.append(f"{r['label']}: {r['path']} {r['error']}")
+            console.print(f"  [red]{r['label']}[/] {escape(r['path'])}: {escape(r['error'])}")
+    keys = [t.key for t in targets]
+
+    console.rule("[cyan]4/6 pre-commit guard[/]")
+    if no_hooks:
+        console.print("  [grey50]skipped (--no-hooks)[/]")
+    elif not has_git or not (project / ".git").exists():
+        console.print("  [grey50]skipped: not a git repository[/]")
+    else:
+        try:
+            hook = install_hook(project)
+            console.print(f"  [green]installed[/] -> {escape(hook['path'])}"
+                          + (" [dim](existing hook chained)[/]" if hook["chained_existing_hook"] else ""))
+        except (RuntimeError, OSError) as exc:
+            warnings.append(f"pre-commit guard not installed: {exc}")
+            console.print(f"  [yellow]not installed[/] {escape(str(exc))}")
+
+    console.rule("[cyan]5/6 agent rules[/]")
+    rule_files = [name for key, name in (("claude", "CLAUDE.md"), ("cursor", ".cursorrules")) if key in keys]
+    if no_rules or not rule_files:
+        console.print("  [grey50]skipped[/]" + (" (--no-rules)" if no_rules else " (no Claude Code / Cursor target)"))
+    else:
+        for f in k.sync_rules(rule_files)["files"]:
+            style = {"created": "green", "updated": "cyan", "unchanged": "grey50"}.get(f["action"], "red")
+            console.print(f"  [{style}]{f['action']}[/] {escape(f['path'])}" + (f" ({escape(f['reason'])})" if f.get("reason") else ""))
+
+    console.rule("[cyan]6/6 live MCP handshake[/]")
+    verified = True
+    if no_verify:
+        console.print("  [grey50]skipped (--no-verify)[/]")
+    else:
+        with console.status("[cyan]Starting the MCP server exactly like your IDE will...[/]"):
+            v = verify_mcp_server(command, args, cwd=project)
+        verified = v["ok"]
+        if verified:
+            name = (v.get("server") or {}).get("name", "aether")
+            console.print(f"  [green]ok[/] {escape(str(name))} answered with {v['tools']} tools in {v['ms']} ms")
+        else:
+            console.print(f"  [red]failed[/] {escape(v.get('error', 'unknown error'))}")
+            warnings.append("the MCP server did not answer; run `aether mcp` in this folder to see the error")
+
+    lines = ["[bold green]AetherOS is ready.[/]" if verified else "[bold yellow]Setup finished with problems.[/]", "",
+             "Next:"]
+    lines += [f"  - {NEXT_STEPS[key]}" for key in keys]
+    lines += ["  - 3D dashboard: [bold]aether web --open[/]", "  - ask your agent: \"use query_smart_context to explain this repo\""]
+    if warnings:
+        lines += ["", "[yellow]Warnings:[/]", *[f"  - {escape(w)}" for w in warnings]]
+    console.print(Panel(Text.from_markup("\n".join(lines)), border_style="green" if verified else "yellow"))
+    if not verified:
         raise typer.Exit(1)
 
 
